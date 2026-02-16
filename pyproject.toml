@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orca-focus"
+version = "0.1.0"
+description = "Real-time astigmatic autofocus control for ORCA and MCL hardware"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "hilo" }
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+ui = [
+  "napari>=0.4",
+  "matplotlib>=3.7",
+]
+camera = [
+  "pylablib>=1.4",
+]
+perf = [
+  "numpy>=1.24",
+]
+
+[project.scripts]
+orca-focus = "orca_focus.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
