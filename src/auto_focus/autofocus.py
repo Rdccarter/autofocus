@@ -140,6 +140,21 @@ class AstigmaticAutofocusController:
 
     def update_roi(self, roi: Roi) -> None:
         self.update_config(roi=roi)
+        self.reset_lock_state()
+
+    def reset_lock_state(self) -> None:
+        """Clear control memory so lock is re-acquired cleanly after ROI changes."""
+        self._integral_um = 0.0
+        self._filtered_error_um = None
+        self._last_error_um = None
+        self._filtered_derivative = 0.0
+        self._z_lock_center_um = None
+        self._last_commanded_z_um = None
+        self._last_command_time_s = None
+        self._setpoint_error = 0.0
+        self._last_frame_ts = None
+        self._degraded_count = 0
+        self._state = AutofocusState.CALIBRATED_READY
 
     def _validate_config(self) -> None:
         if self._config.loop_hz <= 0:

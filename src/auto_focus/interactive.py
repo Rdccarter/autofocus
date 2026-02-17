@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from .autofocus import AutofocusConfig
-from .calibration import FocusCalibration
+from .autofocus import AutofocusConfig, CalibrationLike
 from .interfaces import CameraInterface, StageInterface
 
 
@@ -9,7 +8,7 @@ def launch_autofocus_viewer(
     camera: CameraInterface,
     stage: StageInterface,
     *,
-    calibration: FocusCalibration,
+    calibration: CalibrationLike,
     default_config: AutofocusConfig,
     interval_ms: int = 20,
     calibration_output_path: str | None = None,
