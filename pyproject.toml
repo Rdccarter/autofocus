@@ -19,8 +19,9 @@ dev = [
   "pytest>=8.0",
 ]
 ui = [
-  "napari>=0.4",
-  "matplotlib>=3.7",
+  "pyqtgraph>=0.13",
+  "PyQt5>=5.15",
+  "numpy>=1.24",
 ]
 camera = [
   "pylablib>=1.4",
