@@ -183,10 +183,29 @@ class AstigmaticAutofocusController:
     def _roi_confidence_ok(self, image, total_intensity: float, config: AutofocusConfig) -> bool:
         if config.min_roi_intensity is not None and total_intensity < config.min_roi_intensity:
             return False
-        patch = [row[config.roi.x : config.roi.x + config.roi.width] for row in image[config.roi.y : config.roi.y + config.roi.height]]
-        if not patch or not patch[0]:
-            return False
-        pixels = [float(v) for r in patch for v in r]
+
+        try:
+            import numpy as np
+
+            arr = np.asarray(image, dtype=float)
+            if arr.ndim != 2:
+                return False
+            y0 = max(0, int(config.roi.y))
+            x0 = max(0, int(config.roi.x))
+            y1 = min(arr.shape[0], y0 + int(config.roi.height))
+            x1 = min(arr.shape[1], x0 + int(config.roi.width))
+            if y1 <= y0 or x1 <= x0:
+                return False
+            patch = arr[y0:y1, x0:x1]
+            if patch.size == 0:
+                return False
+            pixels = [float(v) for v in patch.ravel()]
+        except Exception:
+            patch = [row[config.roi.x : config.roi.x + config.roi.width] for row in image[config.roi.y : config.roi.y + config.roi.height]]
+            if len(patch) == 0 or len(patch[0]) == 0:
+                return False
+            pixels = [float(v) for r in patch for v in r]
+
         if not pixels:
             return False
         mean = sum(pixels) / len(pixels)

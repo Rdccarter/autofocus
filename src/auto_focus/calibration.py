@@ -814,37 +814,66 @@ def fit_calibration_model(
 
     if model == "poly2":
         ss = _sanitize_calibration_samples(samples)
-        n = len(ss)
+        z_reference_um = _weighted_z_reference(ss)
+        centered = _center_samples_on_reference(ss, z_reference_um)
+        n = len(centered)
         sum_w = sum(max(0.0, s.weight) for s in ss)
         if sum_w <= 0:
             raise ValueError("Calibration sample weights must contain positive mass")
-        # Weighted quadratic via normal equations reduced to linear at focus.
-        e = [s.error for s in ss]
-        z = [s.z_um for s in ss]
-        w = [max(0.0, s.weight) for s in ss]
+
+        # Weighted quadratic model in local (centered) Z frame.
+        e = [s.error for s in centered]
+        z = [s.z_um for s in centered]
+        w = [max(0.0, s.weight) for s in centered]
         X = np.vstack([np.array(e) ** 2, np.array(e), np.ones(n)]).T
         W = np.diag(np.array(w))
         beta = np.linalg.pinv(X.T @ W @ X) @ (X.T @ W @ np.array(z))
         a, b, c = [float(v) for v in beta]
-        # dz/de at estimated focus (root of derivative set by minimum residual near median error)
-        e0 = sorted(e)[n // 2]
+
+        # Estimate focus error e0 from z(e)=0 roots; choose root nearest weighted median error.
+        if abs(a) < 1e-12:
+            if abs(b) < 1e-12:
+                raise ValueError("Polynomial calibration is degenerate near focus")
+            e0 = -c / b
+        else:
+            disc = (b * b) - (4.0 * a * c)
+            if disc < 0.0:
+                e0 = sorted(e)[n // 2]
+            else:
+                sqrt_disc = math.sqrt(disc)
+                r1 = (-b + sqrt_disc) / (2.0 * a)
+                r2 = (-b - sqrt_disc) / (2.0 * a)
+                e_med = sorted(e)[n // 2]
+                e0 = r1 if abs(r1 - e_med) <= abs(r2 - e_med) else r2
+
+        # Linearize around estimated focus so runtime control stays compatible
+        # with the linear mapping interface.
         slope = 2.0 * a * e0 + b
         if slope == 0.0:
             slope = b if b != 0 else 1e-6
-        intercept = c
-        return _fit_report(ss, slope, intercept, robust=robust, n_inliers=len(ss))
+        intercept = -slope * e0
+        return _fit_report(centered, slope, intercept, robust=robust, n_inliers=len(centered))
 
     if model == "piecewise":
-        ss = sorted(_sanitize_calibration_samples(samples), key=lambda s: s.error)
-        mid = len(ss) // 2
-        left = ss[: max(2, mid)]
-        right = ss[max(0, mid - 1):]
+        ss = _sanitize_calibration_samples(samples)
+        z_reference_um = _weighted_z_reference(ss)
+        centered = sorted(_center_samples_on_reference(ss, z_reference_um), key=lambda s: s.error)
+        mid = len(centered) // 2
+        left = centered[: max(2, mid)]
+        right = centered[max(0, mid - 1):]
         l_slope, l_int = _weighted_linear_fit(left)
         r_slope, r_int = _weighted_linear_fit(right)
-        # Blend around central error for control-friendly single slope.
+
+        # Estimate focus error from line intersection and collapse to one local slope.
+        if abs(l_slope - r_slope) < 1e-12:
+            e0 = centered[mid].error
+        else:
+            e0 = (r_int - l_int) / (l_slope - r_slope)
+
         slope = 0.5 * (l_slope + r_slope)
-        intercept = 0.5 * (l_int + r_int)
-        return _fit_report(ss, slope, intercept, robust=robust, n_inliers=len(ss))
+        z0 = 0.5 * ((l_slope * e0 + l_int) + (r_slope * e0 + r_int))
+        intercept = z0 - slope * e0
+        return _fit_report(centered, slope, intercept, robust=robust, n_inliers=len(centered))
 
     raise ValueError(f"Unsupported model: {model}")
 
