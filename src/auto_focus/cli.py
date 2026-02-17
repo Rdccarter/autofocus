@@ -61,6 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--stage-dll", default=None, help="Path to MCL stage DLL")
+    parser.add_argument("--stage-axis", type=int, default=3, help="MCL axis index for Z moves (commonly 1 or 3 depending on controller/wrapper)")
     parser.add_argument(
         "--stage-wrapper", default=None, help="Python module path for MCL wrapper"
     )
@@ -82,6 +83,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-missing-calibration", action="store_true", help="Allow runtime with default calibration when no calibration file exists")
     parser.add_argument("--calibration-model", choices=["linear", "poly2", "piecewise"], default="linear", help="Calibration fit model")
     parser.add_argument(
+        "--calibration-expected-slope",
+        choices=["auto", "positive", "negative"],
+        default="auto",
+        help="Expected sign of calibration slope. Use auto to disable sign warnings for unknown optical orientation.",
+    )
+    parser.add_argument(
         "--calibration-half-range-um",
         type=float,
         default=0.75,
@@ -96,7 +103,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _load_startup_calibration(samples_csv: str | None, *, model: str = "linear") -> FocusCalibration:
+def _load_startup_calibration(
+    samples_csv: str | None,
+    *,
+    model: str = "linear",
+    expected_slope: str = "auto",
+) -> FocusCalibration:
     if not samples_csv:
         raise ValueError(
             "Calibration CSV path is required. Provide --calibration-csv to reuse a saved sweep."
@@ -137,15 +149,11 @@ def _load_startup_calibration(samples_csv: str | None, *, model: str = "linear")
         # Fall back to linear calibration
         samples = load_calibration_samples_csv(csv_path)
         report = fit_calibration_model(samples, model=model, robust=True)
-        calibration = FocusCalibration(
-            error_at_focus=0.0,
-            error_to_um=report.calibration.error_to_um,
-        )
+        calibration = report.calibration
         print(
             "Loaded linear calibration "
             f"({csv_path}): slope={calibration.error_to_um:+0.4f} um/error, "
-            f"fitted_error_at_focus={report.calibration.error_at_focus:+0.4f}, "
-            "using_control_error_at_focus=+0.0000, "
+            f"error_at_focus={calibration.error_at_focus:+0.4f}, "
             f"R^2={report.r2:0.4f}, inliers={report.n_inliers}/{report.n_samples}",
             file=sys.stderr,
         )
@@ -164,14 +172,24 @@ def _load_startup_calibration(samples_csv: str | None, *, model: str = "linear")
                 file=sys.stderr,
             )
 
-        try:
-            validate_calibration_sign(report.calibration, expected_positive_slope=True)
-        except ValueError as sign_err:
-            print(f"Warning: {sign_err}", file=sys.stderr)
+        if expected_slope in {"positive", "negative"}:
+            try:
+                validate_calibration_sign(
+                    calibration,
+                    expected_positive_slope=(expected_slope == "positive"),
+                )
+            except ValueError as sign_err:
+                print(f"Warning: {sign_err}", file=sys.stderr)
+                print(
+                    "Calibration slope sign does not match requested expectation. "
+                    "If this setup is known to use the opposite orientation, pass "
+                    "--calibration-expected-slope auto or the matching sign.",
+                    file=sys.stderr,
+                )
+        else:
+            sign_txt = "positive" if calibration.error_to_um > 0 else "negative"
             print(
-                "The calibration slope sign may be inverted for your optical setup. "
-                "If autofocus diverges, negate the slope or check your cylindrical "
-                "lens orientation.",
+                f"Calibration slope sign (auto mode): {sign_txt} ({calibration.error_to_um:+0.4f} um/error)",
                 file=sys.stderr,
             )
 
@@ -187,7 +205,7 @@ def _build_stage(args, *, mm_core=None) -> StageInterface:
                 "Warning: --stage simulate ignores --stage-dll/--stage-wrapper inputs.",
                 file=sys.stderr,
             )
-        return MclNanoZStage()
+        return MclNanoZStage(axis_index=args.stage_axis)
 
     if stage_backend == "micromanager":
         if mm_core is None:
@@ -205,7 +223,7 @@ def _build_stage(args, *, mm_core=None) -> StageInterface:
         return MicroManagerStage(core=mm_core)
 
     try:
-        stage = MclNanoZStage(dll_path=args.stage_dll, wrapper_module=args.stage_wrapper)
+        stage = MclNanoZStage(dll_path=args.stage_dll, wrapper_module=args.stage_wrapper, axis_index=args.stage_axis)
     except (NotConnectedError, OSError, FileNotFoundError) as exc:
         raise RuntimeError(
             f"Failed to initialize MCL stage: {exc}. "
@@ -275,7 +293,11 @@ def main() -> int:
             command_deadband_um=args.command_deadband_um,
         )
         try:
-            calibration = _load_startup_calibration(args.calibration_csv, model=args.calibration_model)
+            calibration = _load_startup_calibration(
+                args.calibration_csv,
+                model=args.calibration_model,
+                expected_slope=args.calibration_expected_slope,
+            )
         except ValueError as exc:
             if (not args.show_live) or (not args.allow_missing_calibration):
                 raise

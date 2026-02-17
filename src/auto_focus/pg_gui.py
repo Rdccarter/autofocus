@@ -15,14 +15,14 @@ Slot = getattr(QtCore, "Slot", QtCore.pyqtSlot)
 from .autofocus import AstigmaticAutofocusController, AutofocusConfig, AutofocusState
 from .calibration import (
     CalibrationMetadata,
+    CalibrationSample,
     FocusCalibration,
-    auto_calibrate,
     calibration_quality_issues,
     fit_linear_calibration_with_report,
     save_calibration_metadata_json,
     save_calibration_samples_csv,
 )
-from .focus_metric import Roi
+from .focus_metric import Roi, astigmatic_error_signal, roi_total_intensity
 from .interfaces import CameraFrame, CameraInterface, StageInterface
 from .ui_signals import AutofocusSignals
 
@@ -388,20 +388,45 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
         def _task() -> None:
             try:
                 QtCore.QMetaObject.invokeMethod(self._af_worker, "stop_loop", QtCore.Qt.QueuedConnection)
-                self._camera_worker.pause()
                 roi = self._controller.get_config_snapshot().roi
                 center = float(self._stage.get_z_um())
 
+                def _wait_for_new_frame(last_seq: int, timeout_s: float = 1.0):
+                    deadline = time.monotonic() + max(0.05, timeout_s)
+                    while time.monotonic() < deadline:
+                        frame, seq = self._frame_queue.get_latest()
+                        if frame is not None and seq > last_seq:
+                            return frame, seq
+                        time.sleep(0.005)
+                    raise RuntimeError("Timed out waiting for camera frame during calibration")
+
                 def _collect_and_check(*, half_range_um: float, n_steps: int, settle_s: float):
-                    samples_local = auto_calibrate(
-                        self._camera,
-                        self._stage,
-                        roi,
-                        z_min_um=center - half_range_um,
-                        z_max_um=center + half_range_um,
-                        n_steps=n_steps,
-                        settle_s=settle_s,
-                    )
+                    if n_steps < 2:
+                        raise ValueError("n_steps must be >= 2")
+                    z_min_um = center - half_range_um
+                    z_max_um = center + half_range_um
+                    step = (z_max_um - z_min_um) / float(n_steps - 1)
+                    forward_targets = [z_min_um + i * step for i in range(n_steps)]
+                    targets = forward_targets + list(reversed(forward_targets))
+
+                    samples_local: list[CalibrationSample] = []
+                    _, last_seq = self._frame_queue.get_latest()
+
+                    for i, target_z in enumerate(targets):
+                        self._stage.move_z_um(target_z)
+                        if settle_s > 0:
+                            time.sleep(settle_s)
+                        measured_z = target_z
+                        try:
+                            measured_z = float(self._stage.get_z_um())
+                        except Exception:
+                            pass
+                        frame, last_seq = _wait_for_new_frame(last_seq)
+                        err = astigmatic_error_signal(frame.image, roi)
+                        weight = roi_total_intensity(frame.image, roi)
+                        samples_local.append(CalibrationSample(z_um=measured_z, error=err, weight=max(0.0, weight)))
+                        self._signals.status.emit(f"Calibrating {i+1}/{len(targets)}")
+
                     report_local = fit_linear_calibration_with_report(samples_local, robust=True)
                     issues_local = calibration_quality_issues(samples_local, report_local)
                     return samples_local, report_local, issues_local
@@ -430,7 +455,7 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
                 if issues:
                     self._signals.fault.emit("Calibration failed: " + "; ".join(issues))
                     return
-                self._calibration = FocusCalibration(error_at_focus=0.0, error_to_um=report.calibration.error_to_um)
+                self._calibration = report.calibration
                 self._controller.calibration = self._calibration
                 out = Path(self._calibration_output_path)
                 save_calibration_samples_csv(out, samples)
@@ -443,8 +468,6 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
                 self._signals.status.emit(f"Calibration saved: {out}")
             except Exception as exc:
                 self._signals.fault.emit(f"Calibration failure: {exc}")
-            finally:
-                self._camera_worker.resume()
 
         threading.Thread(target=_task, daemon=True).start()
 
