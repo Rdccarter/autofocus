@@ -34,8 +34,9 @@ class LatestFrameQueue:
         self._seq = 0
 
     def put(self, frame: CameraFrame) -> None:
+        normalized = _normalize_frame(frame)
         with self._lock:
-            self._latest = CameraFrame(image=[list(row) for row in frame.image], timestamp_s=frame.timestamp_s)
+            self._latest = normalized
             self._seq += 1
 
     def get_latest(self) -> tuple[CameraFrame | None, int]:
@@ -74,10 +75,35 @@ class CameraWorker(threading.Thread):
             try:
                 frame = self._camera.get_frame()
                 self._queue.put(frame)
-                self._signals.frame_ready.emit(frame)
+                latest, _ = self._queue.get_latest()
+                if latest is not None:
+                    self._signals.frame_ready.emit(latest)
             except Exception as exc:  # pragma: no cover
                 self._signals.fault.emit(f"Camera failure: {exc}")
                 time.sleep(0.05)
+
+
+def _normalize_frame(frame: CameraFrame) -> CameraFrame:
+    """Ensure camera frames are 2D and detached before cross-thread use."""
+    try:
+        import numpy as np
+
+        arr = np.asarray(frame.image)
+        if arr.ndim == 3 and 1 in arr.shape:
+            arr = np.squeeze(arr)
+        if arr.ndim != 2:
+            raise ValueError(f"Camera frame must be 2D (received shape={arr.shape!r})")
+        # Copy to detach from camera-owned buffers that may be reused.
+        return CameraFrame(image=arr.copy(), timestamp_s=frame.timestamp_s)
+    except ImportError:
+        image = frame.image
+        if hasattr(image, "tolist") and callable(image.tolist):
+            image = image.tolist()
+        if isinstance(image, tuple):
+            image = list(image)
+        if not isinstance(image, list) or not image or not isinstance(image[0], (list, tuple)):
+            raise ValueError("Camera frame must be 2D")
+        return CameraFrame(image=[list(row) for row in image], timestamp_s=frame.timestamp_s)
 
 
 class AutofocusWorkerObject(QtCore.QObject):
@@ -166,6 +192,7 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
         self._history_err = deque(maxlen=400)
         self._history_corr = deque(maxlen=400)
         self._last_cmd = None
+        self._image_levels: tuple[float, float] | None = None
 
         self._controller = AstigmaticAutofocusController(
             camera=self._camera,
@@ -278,10 +305,27 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
     def _on_frame(self, frame: CameraFrame) -> None:
         try:
             import numpy as np
-            arr = np.asarray(frame.image, dtype=float)
-            self._img.setImage(arr, autoLevels=False)
-        except Exception:
-            pass
+            arr = np.asarray(frame.image)
+            if arr.ndim == 3 and 1 in arr.shape:
+                arr = np.squeeze(arr)
+            if arr.ndim != 2:
+                raise ValueError(f"Camera frame must be 2D (received shape={arr.shape!r})")
+
+            if arr.dtype.kind in ("f", "c"):
+                finite = arr[np.isfinite(arr)]
+                if finite.size:
+                    lo = float(np.min(finite))
+                    hi = float(np.max(finite))
+                    if lo == hi:
+                        hi = lo + 1.0
+                    self._image_levels = (lo, hi)
+                elif self._image_levels is None:
+                    self._image_levels = (0.0, 1.0)
+                self._img.setImage(arr, autoLevels=False, levels=self._image_levels)
+            else:
+                self._img.setImage(arr, autoLevels=False)
+        except Exception as exc:
+            self._signals.fault.emit(f"Display failure: {exc}")
 
     @Slot(object)
     def _on_update(self, sample) -> None:
