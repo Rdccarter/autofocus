@@ -95,7 +95,7 @@ class MicroManagerFrameSource:
                 frame_identity = _frame_identity(frame)
 
         payload = _extract_image_payload(frame)
-        payload = _reshape_payload_if_needed(payload, frame)
+        payload = _reshape_payload_if_needed(payload, frame, core)
         image = _to_image_2d(payload)
 
         with self._lock:
@@ -174,7 +174,7 @@ def _frame_metadata_dict(frame: Any) -> dict[str, Any] | None:
 
 
 
-def _frame_dimensions(frame: Any) -> tuple[int, int] | None:
+def _frame_dimensions(frame: Any, core: Any | None = None) -> tuple[int, int] | None:
     md = _frame_metadata_dict(frame)
     if md:
         width_keys = ("Width", "ImageWidth", "width", "image_width")
@@ -201,10 +201,38 @@ def _frame_dimensions(frame: Any) -> tuple[int, int] | None:
                     return h, w
             except Exception:
                 pass
+
+    if core is not None:
+        try:
+            width = _call_core(core, ("getImageWidth", "get_image_width"))
+            height = _call_core(core, ("getImageHeight", "get_image_height"))
+            w = int(width)
+            h = int(height)
+            if w > 0 and h > 0:
+                return h, w
+        except Exception:
+            pass
     return None
 
 
-def _reshape_payload_if_needed(payload: Any, frame: Any) -> Any:
+def _reshape_payload_if_needed(payload: Any, frame: Any, core: Any | None = None) -> Any:
+    if hasattr(payload, "shape"):
+        try:
+            shape = tuple(int(v) for v in payload.shape)
+            if len(shape) == 2:
+                return payload
+            if len(shape) == 3 and 1 in shape:
+                try:
+                    import numpy as np
+
+                    squeezed = np.squeeze(payload)
+                    if getattr(squeezed, "ndim", None) == 2:
+                        return squeezed
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     if hasattr(payload, "tolist") and callable(payload.tolist):
         payload = payload.tolist()
 
@@ -220,7 +248,7 @@ def _reshape_payload_if_needed(payload: Any, frame: Any) -> Any:
     if isinstance(first, (list, tuple)):
         return payload
 
-    dims = _frame_dimensions(frame)
+    dims = _frame_dimensions(frame, core)
     if dims is None:
         return payload
 
