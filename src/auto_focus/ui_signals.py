@@ -10,4 +10,6 @@ class AutofocusSignals(QtCore.QObject):
     autofocus_update = Signal(object)
     state_changed = Signal(str)
     fault = Signal(str)
+    status = Signal(str)
     roi_changed = Signal(tuple)
+    config_changed = Signal(dict)

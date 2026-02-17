@@ -41,3 +41,6 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+
+[tool.setuptools.package-data]
+"auto_focus" = ["py.typed"]

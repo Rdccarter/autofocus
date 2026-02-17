@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import queue
 import threading
 import time
 from collections import deque
@@ -59,9 +58,19 @@ class CameraWorker(threading.Thread):
         self._queue = frame_queue
         self._signals = signals
         self._stop_evt = stop_evt
+        self._pause_evt = threading.Event()
+
+    def pause(self) -> None:
+        self._pause_evt.set()
+
+    def resume(self) -> None:
+        self._pause_evt.clear()
 
     def run(self) -> None:
         while not self._stop_evt.is_set():
+            if self._pause_evt.is_set():
+                time.sleep(0.01)
+                continue
             try:
                 frame = self._camera.get_frame()
                 self._queue.put(frame)
@@ -93,7 +102,11 @@ class AutofocusWorkerObject(QtCore.QObject):
 
     @Slot(tuple)
     def update_roi(self, roi_bounds: tuple[int, int, int, int]) -> None:
-        self._controller._config.roi = Roi(*roi_bounds)
+        self._controller.update_roi(Roi(*roi_bounds))
+
+    @Slot(dict)
+    def update_config(self, values: dict) -> None:
+        self._controller.update_config(**values)
 
     @Slot()
     def start_loop(self) -> None:
@@ -165,6 +178,7 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
         self._af_worker = AutofocusWorkerObject(self._controller, self._frame_queue, self._signals, self._stats, self._stop_evt)
         self._af_worker.moveToThread(self._af_thread)
         self._signals.roi_changed.connect(self._af_worker.update_roi, QtCore.Qt.QueuedConnection)
+        self._signals.config_changed.connect(self._af_worker.update_config, QtCore.Qt.QueuedConnection)
         self._af_thread.start()
 
         self._camera_worker = CameraWorker(self._camera, self._frame_queue, self._signals, self._stop_evt)
@@ -235,18 +249,24 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
         self._signals.autofocus_update.connect(self._on_update)
         self._signals.state_changed.connect(self._on_state)
         self._signals.fault.connect(self._on_fault)
+        self._signals.status.connect(self._on_status)
 
         self._roi.sigRegionChangeFinished.connect(self._emit_roi_change)
         self._start_btn.clicked.connect(lambda: QtCore.QMetaObject.invokeMethod(self._af_worker, "start_loop", QtCore.Qt.QueuedConnection))
         self._stop_btn.clicked.connect(lambda: QtCore.QMetaObject.invokeMethod(self._af_worker, "stop_loop", QtCore.Qt.QueuedConnection))
         self._cal_btn.clicked.connect(self._run_calibration)
         self._lock_setpoint.toggled.connect(self._on_lock_setpoint)
-        self._kp.valueChanged.connect(lambda v: setattr(self._controller._config, 'kp', float(v)))
-        self._ki.valueChanged.connect(lambda v: setattr(self._controller._config, 'ki', float(v)))
-        self._kd.valueChanged.connect(lambda v: setattr(self._controller._config, 'kd', float(v)))
-        self._max_step.valueChanged.connect(lambda v: setattr(self._controller._config, 'max_step_um', float(v)))
-        self._deadband.valueChanged.connect(lambda v: setattr(self._controller._config, 'command_deadband_um', float(v)))
-        self._max_speed.valueChanged.connect(lambda v: setattr(self._controller._config, 'max_slew_rate_um_per_s', (None if v <= 0 else float(v))))
+        self._kp.valueChanged.connect(lambda v: self._queue_config_update(kp=float(v)))
+        self._ki.valueChanged.connect(lambda v: self._queue_config_update(ki=float(v)))
+        self._kd.valueChanged.connect(lambda v: self._queue_config_update(kd=float(v)))
+        self._max_step.valueChanged.connect(lambda v: self._queue_config_update(max_step_um=float(v)))
+        self._deadband.valueChanged.connect(lambda v: self._queue_config_update(command_deadband_um=float(v)))
+        self._max_speed.valueChanged.connect(
+            lambda v: self._queue_config_update(max_slew_rate_um_per_s=(None if v <= 0 else float(v)))
+        )
+
+    def _queue_config_update(self, **values) -> None:
+        self._signals.config_changed.emit(values)
 
     def _emit_roi_change(self) -> None:
         pos = self._roi.pos()
@@ -309,15 +329,20 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
         self._status.setText(message)
         self._on_state(AutofocusState.FAULT.value)
 
+    @Slot(str)
+    def _on_status(self, message: str) -> None:
+        self._status.setText(message)
+
     def _on_lock_setpoint(self, enabled: bool) -> None:
-        self._controller._config.lock_setpoint = bool(enabled)
+        self._queue_config_update(lock_setpoint=bool(enabled))
 
     def _run_calibration(self) -> None:
         def _task() -> None:
             try:
                 QtCore.QMetaObject.invokeMethod(self._af_worker, "stop_loop", QtCore.Qt.QueuedConnection)
+                self._camera_worker.pause()
+                roi = self._controller.get_config_snapshot().roi
                 center = float(self._stage.get_z_um())
-                roi = self._controller._config.roi
                 samples = auto_calibrate(
                     self._camera,
                     self._stage,
@@ -341,9 +366,11 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
                     created_at_unix_s=time.time(),
                 )
                 save_calibration_metadata_json(out.with_suffix('.meta.json'), meta)
-                self._status.setText(f"Calibration saved: {out}")
+                self._signals.status.emit(f"Calibration saved: {out}")
             except Exception as exc:
                 self._signals.fault.emit(f"Calibration failure: {exc}")
+            finally:
+                self._camera_worker.resume()
 
         threading.Thread(target=_task, daemon=True).start()
 
@@ -357,7 +384,7 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
             "dropped_frames": self._stats.dropped_frames,
             "total_frames": self._stats.total_frames,
             "faults": self._stats.faults,
-            "config": asdict(self._controller._config),
+            "config": asdict(self._controller.get_config_snapshot()),
         }
         Path("autofocus_run_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         super().closeEvent(event)

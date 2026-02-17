@@ -7,6 +7,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+import numpy as np
+
 
 from .focus_metric import Roi, astigmatic_error_signal, roi_total_intensity, fit_gaussian_psf
 from .interfaces import CameraInterface, StageInterface
@@ -700,13 +702,13 @@ def fit_zhuang_calibration(
             f"need at least 10. Check ROI placement and PSF quality."
         )
 
-    z = _np().array([s.z_um for s in good])
-    sx = _np().array([s.sigma_x for s in good]) * pixel_size_um
-    sy = _np().array([s.sigma_y for s in good]) * pixel_size_um
+    z = np.array([s.z_um for s in good])
+    sx = np.array([s.sigma_x for s in good]) * pixel_size_um
+    sy = np.array([s.sigma_y for s in good]) * pixel_size_um
     ell = sx / sy
 
     # Center Z for fitting
-    z_center = float(_np().mean(z))
+    z_center = float(np.mean(z))
     z_local = z - z_center
 
     # Fit individual axes
@@ -754,11 +756,6 @@ def fit_zhuang_calibration(
         linear_slope=linear_slope,
     )
 
-
-def _np():
-    """Lazy numpy import."""
-    import numpy as np
-    return np
 
 
 def save_zhuang_calibration_samples_csv(
@@ -825,7 +822,6 @@ def fit_calibration_model(
         e = [s.error for s in ss]
         z = [s.z_um for s in ss]
         w = [max(0.0, s.weight) for s in ss]
-        import numpy as np
         X = np.vstack([np.array(e) ** 2, np.array(e), np.ones(n)]).T
         W = np.diag(np.array(w))
         beta = np.linalg.pinv(X.T @ W @ X) @ (X.T @ W @ np.array(z))

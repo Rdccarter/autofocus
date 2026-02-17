@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import math
 import threading
 import time
@@ -109,10 +110,12 @@ class AstigmaticAutofocusController:
         self._setpoint_error: float = 0.0
         self._state = AutofocusState.CALIBRATED_READY
         self._degraded_count = 0
+        self._config_lock = threading.RLock()
 
     @property
     def loop_hz(self) -> float:
-        return self._config.loop_hz
+        with self._config_lock:
+            return self._config.loop_hz
 
     @property
     def calibration(self) -> CalibrationLike:
@@ -122,6 +125,21 @@ class AstigmaticAutofocusController:
     def calibration(self, value: CalibrationLike) -> None:
         self._calibration = value
         self._state = AutofocusState.CALIBRATED_READY
+
+    def get_config_snapshot(self) -> AutofocusConfig:
+        with self._config_lock:
+            return copy.deepcopy(self._config)
+
+    def update_config(self, **kwargs) -> None:
+        with self._config_lock:
+            for key, value in kwargs.items():
+                if not hasattr(self._config, key):
+                    raise AttributeError(f"Unknown AutofocusConfig field: {key}")
+                setattr(self._config, key, value)
+            self._validate_config()
+
+    def update_roi(self, roi: Roi) -> None:
+        self.update_config(roi=roi)
 
     def _validate_config(self) -> None:
         if self._config.loop_hz <= 0:
@@ -145,27 +163,27 @@ class AstigmaticAutofocusController:
         if self._config.max_slew_rate_um_per_s is not None and self._config.max_slew_rate_um_per_s <= 0:
             raise ValueError("max_slew_rate_um_per_s must be > 0 when provided")
 
-    def _apply_limits(self, target_z_um: float) -> float:
-        if self._z_lock_center_um is not None and self._config.max_abs_excursion_um is not None:
-            excursion = float(self._config.max_abs_excursion_um)
+    def _apply_limits(self, target_z_um: float, config: AutofocusConfig) -> float:
+        if self._z_lock_center_um is not None and config.max_abs_excursion_um is not None:
+            excursion = float(config.max_abs_excursion_um)
             target_z_um = max(self._z_lock_center_um - excursion, min(self._z_lock_center_um + excursion, target_z_um))
-        if self._config.stage_min_um is not None:
-            target_z_um = max(self._config.stage_min_um, target_z_um)
-        if self._config.stage_max_um is not None:
-            target_z_um = min(self._config.stage_max_um, target_z_um)
+        if config.stage_min_um is not None:
+            target_z_um = max(config.stage_min_um, target_z_um)
+        if config.stage_max_um is not None:
+            target_z_um = min(config.stage_max_um, target_z_um)
         return target_z_um
 
-    def _slew_limit(self, proposed_z_um: float, dt_s: float, current_z: float) -> float:
-        if self._config.max_slew_rate_um_per_s is None:
+    def _slew_limit(self, proposed_z_um: float, dt_s: float, current_z: float, config: AutofocusConfig) -> float:
+        if config.max_slew_rate_um_per_s is None:
             return proposed_z_um
         anchor = self._last_commanded_z_um if self._last_commanded_z_um is not None else current_z
-        max_delta = self._config.max_slew_rate_um_per_s * max(0.0, dt_s)
+        max_delta = config.max_slew_rate_um_per_s * max(0.0, dt_s)
         return max(anchor - max_delta, min(anchor + max_delta, proposed_z_um))
 
-    def _roi_confidence_ok(self, image, total_intensity: float) -> bool:
-        if self._config.min_roi_intensity is not None and total_intensity < self._config.min_roi_intensity:
+    def _roi_confidence_ok(self, image, total_intensity: float, config: AutofocusConfig) -> bool:
+        if config.min_roi_intensity is not None and total_intensity < config.min_roi_intensity:
             return False
-        patch = [row[self._config.roi.x : self._config.roi.x + self._config.roi.width] for row in image[self._config.roi.y : self._config.roi.y + self._config.roi.height]]
+        patch = [row[config.roi.x : config.roi.x + config.roi.width] for row in image[config.roi.y : config.roi.y + config.roi.height]]
         if not patch or not patch[0]:
             return False
         pixels = [float(v) for r in patch for v in r]
@@ -173,11 +191,11 @@ class AstigmaticAutofocusController:
             return False
         mean = sum(pixels) / len(pixels)
         var = sum((v - mean) ** 2 for v in pixels) / len(pixels)
-        if self._config.min_roi_variance is not None and var < self._config.min_roi_variance:
+        if config.min_roi_variance is not None and var < config.min_roi_variance:
             return False
-        if self._config.max_saturated_fraction is not None:
-            sat = sum(1 for v in pixels if v >= self._config.saturation_level)
-            if sat / len(pixels) > self._config.max_saturated_fraction:
+        if config.max_saturated_fraction is not None:
+            sat = sum(1 for v in pixels if v >= config.saturation_level)
+            if sat / len(pixels) > config.max_saturated_fraction:
                 return False
         return True
 
@@ -189,9 +207,11 @@ class AstigmaticAutofocusController:
         if self._z_lock_center_um is None:
             self._z_lock_center_um = float(current_z)
 
+        config = self.get_config_snapshot()
+
         if dt_s is None:
-            dt_s = 1.0 / self._config.loop_hz
-        dt_s = max(0.0, min(float(dt_s), self._config.max_dt_s))
+            dt_s = 1.0 / config.loop_hz
+        dt_s = max(0.0, min(float(dt_s), config.max_dt_s))
 
         # Guard: skip duplicate frames (same timestamp as previous).
         if self._last_frame_ts is not None and frame.timestamp_s == self._last_frame_ts:
@@ -199,10 +219,10 @@ class AstigmaticAutofocusController:
             return AutofocusSample(frame.timestamp_s, 0.0, 0.0, current_z, current_z, 0.0, False, False, self._state, (time.monotonic() - loop_start) * 1e3)
         self._last_frame_ts = frame.timestamp_s
 
-        total_intensity = roi_total_intensity(frame.image, self._config.roi)
+        total_intensity = roi_total_intensity(frame.image, config.roi)
 
-        confidence_ok = self._roi_confidence_ok(frame.image, total_intensity)
-        if self._config.edge_margin_px > 0 and centroid_near_edge(frame.image, self._config.roi, self._config.edge_margin_px):
+        confidence_ok = self._roi_confidence_ok(frame.image, total_intensity, config)
+        if config.edge_margin_px > 0 and centroid_near_edge(frame.image, config.roi, config.edge_margin_px):
             confidence_ok = False
 
         if not confidence_ok:
@@ -210,12 +230,13 @@ class AstigmaticAutofocusController:
             self._state = AutofocusState.RECOVERY if self._degraded_count > 8 else AutofocusState.DEGRADED
             return AutofocusSample(frame.timestamp_s, 0.0, 0.0, current_z, current_z, total_intensity, False, False, self._state, (time.monotonic() - loop_start) * 1e3)
         self._degraded_count = 0
+        self._config_lock = threading.RLock()
 
-        error = astigmatic_error_signal(frame.image, self._config.roi)
-        if self._config.lock_setpoint:
+        error = astigmatic_error_signal(frame.image, config.roi)
+        if config.lock_setpoint:
             error -= self._setpoint_error
-        elif self._config.recenter_alpha > 0:
-            self._setpoint_error = self._config.recenter_alpha * self._setpoint_error + (1.0 - self._config.recenter_alpha) * error
+        elif config.recenter_alpha > 0:
+            self._setpoint_error = config.recenter_alpha * self._setpoint_error + (1.0 - config.recenter_alpha) * error
             error -= self._setpoint_error
 
         error_um = self._calibration.error_to_z_offset_um(error)
@@ -223,7 +244,7 @@ class AstigmaticAutofocusController:
             self._state = AutofocusState.FAULT
             raise RuntimeError("Non-finite autofocus error encountered; check ROI/calibration")
 
-        alpha = self._config.error_alpha
+        alpha = config.error_alpha
         if 0.0 < alpha < 1.0 and self._filtered_error_um is not None:
             error_um = alpha * self._filtered_error_um + (1.0 - alpha) * error_um
         self._filtered_error_um = error_um
@@ -232,30 +253,30 @@ class AstigmaticAutofocusController:
         if self._last_error_um is not None and dt_s > 0:
             derivative = (error_um - self._last_error_um) / dt_s
         self._last_error_um = error_um
-        d_alpha = self._config.derivative_alpha
+        d_alpha = config.derivative_alpha
         self._filtered_derivative = d_alpha * self._filtered_derivative + (1.0 - d_alpha) * derivative
         d_term = self._filtered_derivative
-        if self._last_command_time_s is not None and self._config.stage_latency_s > 0:
+        if self._last_command_time_s is not None and config.stage_latency_s > 0:
             age = max(0.0, time.monotonic() - self._last_command_time_s)
-            d_term *= math.exp(-age / self._config.stage_latency_s)
+            d_term *= math.exp(-age / config.stage_latency_s)
 
         candidate_integral = self._integral_um + error_um * dt_s
-        candidate_integral = max(-self._config.integral_limit_um, min(self._config.integral_limit_um, candidate_integral))
+        candidate_integral = max(-config.integral_limit_um, min(config.integral_limit_um, candidate_integral))
 
         correction = -(
-            self._config.kp * error_um
-            + self._config.ki * candidate_integral
-            + self._config.kd * d_term
+            config.kp * error_um
+            + config.ki * candidate_integral
+            + config.kd * d_term
         )
-        correction = max(-self._config.max_step_um, min(self._config.max_step_um, correction))
+        correction = max(-config.max_step_um, min(config.max_step_um, correction))
 
-        if abs(correction) <= self._config.command_deadband_um:
+        if abs(correction) <= config.command_deadband_um:
             self._state = AutofocusState.LOCKED
             return AutofocusSample(frame.timestamp_s, error, error_um, current_z, current_z, total_intensity, False, True, self._state, (time.monotonic() - loop_start) * 1e3)
 
         raw_target = current_z + correction
-        slew_target = self._slew_limit(raw_target, dt_s, current_z)
-        commanded_z = self._apply_limits(slew_target)
+        slew_target = self._slew_limit(raw_target, dt_s, current_z, config)
+        commanded_z = self._apply_limits(slew_target, config)
 
         # Anti-windup: commit integral only when not saturated by output limits.
         saturated = commanded_z != raw_target
@@ -266,7 +287,7 @@ class AstigmaticAutofocusController:
         self._last_commanded_z_um = commanded_z
         self._last_command_time_s = time.monotonic()
 
-        self._state = AutofocusState.LOCKING if abs(error_um) > self._config.command_deadband_um else AutofocusState.LOCKED
+        self._state = AutofocusState.LOCKING if abs(error_um) > config.command_deadband_um else AutofocusState.LOCKED
         return AutofocusSample(
             timestamp_s=frame.timestamp_s,
             error=error,
@@ -282,7 +303,7 @@ class AstigmaticAutofocusController:
 
     def run(self, duration_s: float) -> list[AutofocusSample]:
         samples: list[AutofocusSample] = []
-        loop_dt = 1.0 / self._config.loop_hz
+        loop_dt = 1.0 / self.loop_hz
         end = time.monotonic() + duration_s
         last_step_start: float | None = None
         while time.monotonic() < end:
