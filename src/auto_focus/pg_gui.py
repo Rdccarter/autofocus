@@ -203,6 +203,10 @@ class AutofocusWorkerObject(QtCore.QObject):
         self._controller.update_config(**values)
 
     @Slot()
+    def reset_lock_state(self) -> None:
+        self._controller.reset_lock_state()
+
+    @Slot()
     def start_loop(self) -> None:
         self._running = True
         self._timer.start(max(1, int(1000.0 / self._controller.loop_hz)))
@@ -435,7 +439,7 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
         self._lat_lbl.setText(f"Loop latency: {sample.loop_latency_ms:.1f} ms")
         self._conf_lbl.setText(f"Confidence: {'good' if sample.confidence_ok else 'low'}")
         self._drop_lbl.setText(f"Frames dropped: {self._stats.dropped_frames}")
-        self._status.setText(f"I={sample.roi_total_intensity:.0f} err={sample.error:+.4f}")
+        self._status.setText(f"I={sample.roi_total_intensity:.0f} err={sample.error:+.4f} — {sample.diagnostic}")
         if sample.confidence_ok:
             self._roi.setPen(pg.mkPen('c', width=2))
         else:
@@ -472,6 +476,7 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
 
     def _on_lock_setpoint(self, enabled: bool) -> None:
         self._queue_config_update(lock_setpoint=bool(enabled))
+        QtCore.QMetaObject.invokeMethod(self._af_worker, "reset_lock_state", QtCore.Qt.QueuedConnection)
 
     def _run_calibration(self) -> None:
         # Read ROI directly from the widget on the GUI thread so the

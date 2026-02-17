@@ -117,3 +117,66 @@ def test_lock_setpoint_applies_only_delta_from_initial_roi_bias(monkeypatch):
     assert second.control_applied is True
     assert stage.moves, "expected correction move"
     assert stage.moves[-1] < 0.0
+
+
+
+def test_out_of_range_sets_diagnostic(monkeypatch):
+    monkeypatch.setattr("auto_focus.autofocus.astigmatic_error_signal", lambda _img, _roi: 0.95)
+    monkeypatch.setattr("auto_focus.autofocus.roi_total_intensity", lambda _img, _roi: 10.0)
+
+    cal = FocusCalibration(error_at_focus=0.0, error_to_um=1.0, error_min=-0.2, error_max=0.2)
+    controller = AstigmaticAutofocusController(DummyCamera(), DummyStage(), _config(), cal)
+
+    sample = controller.run_step()
+
+    assert sample.diagnostic == "error outside calibration domain"
+
+
+def test_transition_lock_disabled_recenter_enabled(monkeypatch):
+    signal = {"value": 0.10}
+
+    def _err(_img, _roi):
+        return signal["value"]
+
+    monkeypatch.setattr("auto_focus.autofocus.astigmatic_error_signal", _err)
+    monkeypatch.setattr("auto_focus.autofocus.roi_total_intensity", lambda _img, _roi: 10.0)
+
+    cal = FocusCalibration(error_at_focus=0.05, error_to_um=1.0, error_min=-0.3, error_max=0.3)
+    stage = DummyStage()
+    controller = AstigmaticAutofocusController(DummyCamera(), stage, _config(), cal)
+
+    controller.run_step()  # initializes lock setpoint
+    controller.update_config(lock_setpoint=False, recenter_alpha=0.5)
+    controller.reset_lock_state()
+    controller._camera.frame = CameraFrame(image=[[1.0]], timestamp_s=2.0)
+    signal["value"] = 0.18
+
+    sample = controller.run_step()
+
+    assert sample.control_applied is False
+    assert sample.state == AutofocusState.LOCKED
+
+
+def test_roi_change_resets_setpoint_memory(monkeypatch):
+    signal = {"value": 0.12}
+
+    def _err(_img, _roi):
+        return signal["value"]
+
+    monkeypatch.setattr("auto_focus.autofocus.astigmatic_error_signal", _err)
+    monkeypatch.setattr("auto_focus.autofocus.roi_total_intensity", lambda _img, _roi: 10.0)
+
+    cal = FocusCalibration(error_at_focus=0.05, error_to_um=1.0, error_min=-0.3, error_max=0.3)
+    stage = DummyStage()
+    controller = AstigmaticAutofocusController(DummyCamera(), stage, _config(), cal)
+
+    controller.run_step()
+    signal["value"] = 0.20
+    controller.update_roi(Roi(x=0, y=0, width=1, height=1))
+    controller._camera.frame = CameraFrame(image=[[1.0]], timestamp_s=2.0)
+
+    sample = controller.run_step()
+
+    # Fresh ROI lock should not apply an immediate move.
+    assert sample.control_applied is False
+    assert sample.state == AutofocusState.LOCKED

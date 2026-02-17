@@ -85,6 +85,7 @@ class AutofocusSample:
     confidence_ok: bool
     state: AutofocusState
     loop_latency_ms: float
+    diagnostic: str = ""
 
 
 class AstigmaticAutofocusController:
@@ -281,7 +282,7 @@ class AstigmaticAutofocusController:
         # Guard: skip duplicate frames (same timestamp as previous).
         if self._last_frame_ts is not None and frame.timestamp_s == self._last_frame_ts:
             self._state = AutofocusState.DEGRADED
-            return AutofocusSample(frame.timestamp_s, 0.0, 0.0, current_z, current_z, 0.0, False, False, self._state, (time.monotonic() - loop_start) * 1e3)
+            return AutofocusSample(frame.timestamp_s, 0.0, 0.0, current_z, current_z, 0.0, False, False, self._state, (time.monotonic() - loop_start) * 1e3, "duplicate frame")
         self._last_frame_ts = frame.timestamp_s
 
         total_intensity = roi_total_intensity(frame.image, config.roi)
@@ -293,9 +294,8 @@ class AstigmaticAutofocusController:
         if not confidence_ok:
             self._degraded_count += 1
             self._state = AutofocusState.RECOVERY if self._degraded_count > 8 else AutofocusState.DEGRADED
-            return AutofocusSample(frame.timestamp_s, 0.0, 0.0, current_z, current_z, total_intensity, False, False, self._state, (time.monotonic() - loop_start) * 1e3)
+            return AutofocusSample(frame.timestamp_s, 0.0, 0.0, current_z, current_z, total_intensity, False, False, self._state, (time.monotonic() - loop_start) * 1e3, "low ROI confidence")
         self._degraded_count = 0
-        self._config_lock = threading.RLock()
 
         error = astigmatic_error_signal(frame.image, config.roi)
         if not self._is_error_in_calibration_domain(error, config):
@@ -312,6 +312,7 @@ class AstigmaticAutofocusController:
                 False,
                 self._state,
                 (time.monotonic() - loop_start) * 1e3,
+                "error outside calibration domain",
             )
 
         if config.lock_setpoint:
@@ -364,7 +365,7 @@ class AstigmaticAutofocusController:
 
         if abs(correction) <= config.command_deadband_um:
             self._state = AutofocusState.LOCKED
-            return AutofocusSample(frame.timestamp_s, error, error_um, current_z, current_z, total_intensity, False, True, self._state, (time.monotonic() - loop_start) * 1e3)
+            return AutofocusSample(frame.timestamp_s, error, error_um, current_z, current_z, total_intensity, False, True, self._state, (time.monotonic() - loop_start) * 1e3, "within deadband")
 
         raw_target = current_z + correction
         slew_target = self._slew_limit(raw_target, dt_s, current_z, config)
@@ -391,6 +392,7 @@ class AstigmaticAutofocusController:
             confidence_ok=True,
             state=self._state,
             loop_latency_ms=(time.monotonic() - loop_start) * 1e3,
+            diagnostic="control update applied",
         )
 
     def run(self, duration_s: float) -> list[AutofocusSample]:
