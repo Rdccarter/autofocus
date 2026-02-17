@@ -8,6 +8,7 @@ from .autofocus import AstigmaticAutofocusController, AutofocusConfig
 from .calibration import (
     FocusCalibration,
     calibration_quality_issues,
+    fit_calibration_model,
     fit_linear_calibration_with_report,
     fit_zhuang_calibration,
     load_calibration_samples_csv,
@@ -78,6 +79,8 @@ def build_parser() -> argparse.ArgumentParser:
             "focus calibration automatically; GUI calibration sweeps also write to this path."
         ),
     )
+    parser.add_argument("--allow-missing-calibration", action="store_true", help="Allow runtime with default calibration when no calibration file exists")
+    parser.add_argument("--calibration-model", choices=["linear", "poly2", "piecewise"], default="linear", help="Calibration fit model")
     parser.add_argument(
         "--calibration-half-range-um",
         type=float,
@@ -93,7 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _load_startup_calibration(samples_csv: str | None) -> FocusCalibration:
+def _load_startup_calibration(samples_csv: str | None, *, model: str = "linear") -> FocusCalibration:
     if not samples_csv:
         raise ValueError(
             "Calibration CSV path is required. Provide --calibration-csv to reuse a saved sweep."
@@ -133,7 +136,7 @@ def _load_startup_calibration(samples_csv: str | None) -> FocusCalibration:
     if not zhuang_loaded:
         # Fall back to linear calibration
         samples = load_calibration_samples_csv(csv_path)
-        report = fit_linear_calibration_with_report(samples, robust=True)
+        report = fit_calibration_model(samples, model=model, robust=True)
         calibration = FocusCalibration(
             error_at_focus=0.0,
             error_to_um=report.calibration.error_to_um,
@@ -271,9 +274,9 @@ def main() -> int:
             command_deadband_um=args.command_deadband_um,
         )
         try:
-            calibration = _load_startup_calibration(args.calibration_csv)
+            calibration = _load_startup_calibration(args.calibration_csv, model=args.calibration_model)
         except ValueError as exc:
-            if not args.show_live:
+            if (not args.show_live) or (not args.allow_missing_calibration):
                 raise
             print(f"Warning: {exc}", file=sys.stderr)
             print(
