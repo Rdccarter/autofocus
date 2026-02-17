@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .autofocus import AstigmaticAutofocusController, AutofocusConfig, CalibrationLike
 from .calibration import (
+    FocusCalibration,
     calibration_quality_issues,
     fit_calibration_model,
     fit_linear_calibration_with_report,
@@ -121,6 +122,7 @@ def _load_startup_calibration(
 
     # Try loading as Zhuang-format CSV (has sigma_x, sigma_y columns)
     zhuang_loaded = False
+    has_gaussian = False
     try:
         zhuang_samples = load_zhuang_calibration_samples_csv(csv_path)
         has_gaussian = any(
@@ -143,15 +145,17 @@ def _load_startup_calibration(
                 zhuang_loaded = True
             else:
                 print(
-                    "Warning: Zhuang calibration quality below threshold "
-                    f"(R²x={zhuang_report.r2_x:.3f}, R²y={zhuang_report.r2_y:.3f}, "
-                    f"usable_range={zhuang_report.usable_range_um}); trying linear.",
+                    f"Warning: Zhuang fit quality too low "
+                    f"(R²_x={zhuang_report.r2_x:.3f}, R²_y={zhuang_report.r2_y:.3f}, "
+                    f"usable_range={zhuang_report.usable_range_um}, "
+                    f"good_fits={zhuang_report.n_good_fits}/{zhuang_report.n_samples}); "
+                    f"falling back to linear.",
                     file=sys.stderr,
                 )
         else:
             print(
-                "Warning: calibration CSV has no finite Gaussian sigma columns; "
-                "Zhuang model unavailable, trying linear.",
+                f"Warning: CSV has no valid Gaussian PSF data (sigma_x/sigma_y columns missing or all NaN); "
+                f"cannot use Zhuang model. Re-run calibration from the GUI to generate Zhuang-compatible data.",
                 file=sys.stderr,
             )
     except Exception as exc:
