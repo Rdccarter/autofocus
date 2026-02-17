@@ -54,6 +54,14 @@ class HamamatsuOrcaCamera(CameraInterface):
     def __exit__(self, _exc_type, _exc, _tb) -> None:
         self.stop()
 
+
+    def __enter__(self) -> "SimulatedCamera":
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:  # pragma: no cover - trivial
+        self.stop()
+
     def get_frame(self) -> CameraFrame:
         if not self._running:
             raise NotConnectedError("Camera not started")
@@ -286,6 +294,14 @@ class SimulatedCamera(CameraInterface):
 
     def stop(self) -> None:
         self._running = False
+
+
+    def __enter__(self) -> "SimulatedCamera":
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:  # pragma: no cover - trivial
+        self.stop()
 
     def get_frame(self) -> CameraFrame:
         if not self._running:
