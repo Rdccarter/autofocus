@@ -4,7 +4,7 @@ import json
 import threading
 import time
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from pyqtgraph.Qt import QtCore, QtWidgets
@@ -12,17 +12,15 @@ import pyqtgraph as pg
 
 Slot = getattr(QtCore, "Slot", QtCore.pyqtSlot)
 
-from .autofocus import AstigmaticAutofocusController, AutofocusConfig, AutofocusState
+from .autofocus import AstigmaticAutofocusController, AutofocusConfig, AutofocusState, CalibrationLike
 from .calibration import (
     CalibrationMetadata,
     CalibrationSample,
-    FocusCalibration,
     ZhuangCalibrationSample,
     calibration_quality_issues,
     fit_linear_calibration_with_report,
     fit_zhuang_calibration,
     save_calibration_metadata_json,
-    save_calibration_samples_csv,
     save_zhuang_calibration_samples_csv,
 )
 from .focus_metric import Roi, astigmatic_error_signal, extract_roi, fit_gaussian_psf, roi_total_intensity
@@ -62,9 +60,7 @@ class FrameTransformState:
     rotation_deg: int = 0
     flip_h: bool = False
     flip_v: bool = False
-
-    def __post_init__(self) -> None:
-        self._lock = threading.Lock()
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
 
     def set(self, *, rotation_deg: int | None = None, flip_h: bool | None = None, flip_v: bool | None = None) -> None:
         with self._lock:
@@ -243,7 +239,7 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
         self,
         camera: CameraInterface,
         stage: StageInterface,
-        calibration: FocusCalibration,
+        calibration: CalibrationLike,
         default_config: AutofocusConfig,
         calibration_output_path: str | None = None,
         calibration_half_range_um: float = 0.75,
@@ -544,16 +540,17 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
 
                     try:
                         z_report = fit_zhuang_calibration(zhuang_samples_local)
-                        return zhuang_samples_local, z_report.calibration, [], "zhuang"
-                    except Exception:
+                        return zhuang_samples_local, z_report.calibration, []
+                    except Exception as exc:
+                        self._signals.status.emit(f"Zhuang fit failed ({exc}); falling back to linear fit")
                         report_local = fit_linear_calibration_with_report(samples_local, robust=True)
                         issues_local = calibration_quality_issues(samples_local, report_local)
-                        return zhuang_samples_local, report_local.calibration, issues_local, "linear"
+                        return zhuang_samples_local, report_local.calibration, issues_local
 
-                samples, calibration_fit, issues, cal_mode = _collect_and_check(
+                samples, calibration_fit, issues = _collect_and_check(
                     half_range_um=self._calibration_half_range_um,
                     n_steps=self._calibration_steps,
-                    settle_s=0.05,
+                    settle_s=0.12,
                 )
 
                 mismatch_issue = "up/down sweep mismatch is high"
@@ -563,13 +560,13 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
                     )
                     retry_half_range = max(0.05, self._calibration_half_range_um * 0.8)
                     retry_steps = max(self._calibration_steps + 10, int(self._calibration_steps * 1.5))
-                    samples_retry, calibration_retry, issues_retry, mode_retry = _collect_and_check(
+                    samples_retry, calibration_retry, issues_retry = _collect_and_check(
                         half_range_um=retry_half_range,
                         n_steps=retry_steps,
-                        settle_s=0.15,
+                        settle_s=0.25,
                     )
                     if len(issues_retry) < len(issues):
-                        samples, calibration_fit, issues, cal_mode = samples_retry, calibration_retry, issues_retry, mode_retry
+                        samples, calibration_fit, issues = samples_retry, calibration_retry, issues_retry
 
                 if issues:
                     self._signals.fault.emit("Calibration failed: " + "; ".join(issues))
@@ -577,10 +574,7 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
                 self._calibration = calibration_fit
                 self._controller.calibration = self._calibration
                 out = Path(self._calibration_output_path)
-                if cal_mode == "zhuang":
-                    save_zhuang_calibration_samples_csv(out, samples)
-                else:
-                    save_calibration_samples_csv(out, [CalibrationSample(z_um=s.z_um, error=s.error, weight=s.weight) for s in samples])
+                save_zhuang_calibration_samples_csv(out, samples)
                 meta = CalibrationMetadata(
                     roi_size=(roi.width, roi.height),
                     stage_type=type(self._stage).__name__,
@@ -616,7 +610,7 @@ def launch_pg_autofocus_gui(
     camera: CameraInterface,
     stage: StageInterface,
     *,
-    calibration: FocusCalibration,
+    calibration: CalibrationLike,
     default_config: AutofocusConfig,
     calibration_output_path: str | None = None,
     calibration_half_range_um: float = 0.75,

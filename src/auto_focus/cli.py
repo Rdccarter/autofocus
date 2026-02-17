@@ -4,9 +4,8 @@ import argparse
 import sys
 from pathlib import Path
 
-from .autofocus import AstigmaticAutofocusController, AutofocusConfig
+from .autofocus import AstigmaticAutofocusController, AutofocusConfig, CalibrationLike
 from .calibration import (
-    FocusCalibration,
     calibration_quality_issues,
     fit_calibration_model,
     fit_linear_calibration_with_report,
@@ -108,7 +107,7 @@ def _load_startup_calibration(
     *,
     model: str = "linear",
     expected_slope: str = "auto",
-) -> FocusCalibration:
+) -> CalibrationLike:
     if not samples_csv:
         raise ValueError(
             "Calibration CSV path is required. Provide --calibration-csv to reuse a saved sweep."
@@ -142,6 +141,19 @@ def _load_startup_calibration(
                     file=sys.stderr,
                 )
                 zhuang_loaded = True
+            else:
+                print(
+                    "Warning: Zhuang calibration quality below threshold "
+                    f"(R²x={zhuang_report.r2_x:.3f}, R²y={zhuang_report.r2_y:.3f}, "
+                    f"usable_range={zhuang_report.usable_range_um}); trying linear.",
+                    file=sys.stderr,
+                )
+        else:
+            print(
+                "Warning: calibration CSV has no finite Gaussian sigma columns; "
+                "Zhuang model unavailable, trying linear.",
+                file=sys.stderr,
+            )
     except Exception as exc:
         print(f"Warning: Zhuang calibration failed ({exc}), trying linear.", file=sys.stderr)
 
