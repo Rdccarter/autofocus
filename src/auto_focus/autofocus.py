@@ -67,6 +67,10 @@ class AutofocusConfig:
     # Setpoint locking + optional guarded recentering.
     lock_setpoint: bool = True
     recenter_alpha: float = 0.0
+    # Guardrail: reject control updates when measured error is outside the
+    # calibration domain. This prevents lookup extrapolation/clamping from
+    # producing large wrong-way moves when changing ROI/target.
+    calibration_error_margin: float = 0.02
 
 
 @dataclass(slots=True)
@@ -81,6 +85,7 @@ class AutofocusSample:
     confidence_ok: bool
     state: AutofocusState
     loop_latency_ms: float
+    diagnostic: str = ""
 
 
 class AstigmaticAutofocusController:
@@ -107,7 +112,7 @@ class AstigmaticAutofocusController:
         self._filtered_derivative: float = 0.0
         self._last_command_time_s: float | None = None
         self._last_commanded_z_um: float | None = None
-        self._setpoint_error: float = 0.0
+        self._setpoint_error: float | None = None
         self._state = AutofocusState.CALIBRATED_READY
         self._degraded_count = 0
         self._config_lock = threading.RLock()
@@ -151,7 +156,7 @@ class AstigmaticAutofocusController:
         self._z_lock_center_um = None
         self._last_commanded_z_um = None
         self._last_command_time_s = None
-        self._setpoint_error = 0.0
+        self._setpoint_error = None
         self._last_frame_ts = None
         self._degraded_count = 0
         self._state = AutofocusState.CALIBRATED_READY
@@ -177,6 +182,33 @@ class AstigmaticAutofocusController:
             raise ValueError("command_deadband_um must be >= 0")
         if self._config.max_slew_rate_um_per_s is not None and self._config.max_slew_rate_um_per_s <= 0:
             raise ValueError("max_slew_rate_um_per_s must be > 0 when provided")
+        if self._config.calibration_error_margin < 0:
+            raise ValueError("calibration_error_margin must be >= 0")
+
+    def _is_error_in_calibration_domain(self, error: float, config: AutofocusConfig) -> bool:
+        checker = getattr(self._calibration, "is_error_in_range", None)
+        if callable(checker):
+            try:
+                return bool(checker(error, margin=config.calibration_error_margin))
+            except Exception:
+                pass
+
+        lookup = getattr(self._calibration, "lookup", None)
+        error_values = getattr(lookup, "error_values", None)
+        if error_values is None:
+            return True
+        if len(error_values) < 2:
+            return True
+        lo = float(error_values[0]) - config.calibration_error_margin
+        hi = float(error_values[-1]) + config.calibration_error_margin
+        return lo <= error <= hi
+
+
+    def _calibration_error_at_focus(self) -> float:
+        try:
+            return float(getattr(self._calibration, "error_at_focus", 0.0))
+        except Exception:
+            return 0.0
 
     def _apply_limits(self, target_z_um: float, config: AutofocusConfig) -> float:
         if self._z_lock_center_um is not None and config.max_abs_excursion_um is not None:
@@ -250,7 +282,7 @@ class AstigmaticAutofocusController:
         # Guard: skip duplicate frames (same timestamp as previous).
         if self._last_frame_ts is not None and frame.timestamp_s == self._last_frame_ts:
             self._state = AutofocusState.DEGRADED
-            return AutofocusSample(frame.timestamp_s, 0.0, 0.0, current_z, current_z, 0.0, False, False, self._state, (time.monotonic() - loop_start) * 1e3)
+            return AutofocusSample(frame.timestamp_s, 0.0, 0.0, current_z, current_z, 0.0, False, False, self._state, (time.monotonic() - loop_start) * 1e3, "duplicate frame")
         self._last_frame_ts = frame.timestamp_s
 
         total_intensity = roi_total_intensity(frame.image, config.roi)
@@ -262,16 +294,43 @@ class AstigmaticAutofocusController:
         if not confidence_ok:
             self._degraded_count += 1
             self._state = AutofocusState.RECOVERY if self._degraded_count > 8 else AutofocusState.DEGRADED
-            return AutofocusSample(frame.timestamp_s, 0.0, 0.0, current_z, current_z, total_intensity, False, False, self._state, (time.monotonic() - loop_start) * 1e3)
+            return AutofocusSample(frame.timestamp_s, 0.0, 0.0, current_z, current_z, total_intensity, False, False, self._state, (time.monotonic() - loop_start) * 1e3, "low ROI confidence")
         self._degraded_count = 0
-        self._config_lock = threading.RLock()
 
         error = astigmatic_error_signal(frame.image, config.roi)
+        if not self._is_error_in_calibration_domain(error, config):
+            self._degraded_count += 1
+            self._state = AutofocusState.RECOVERY if self._degraded_count > 8 else AutofocusState.DEGRADED
+            return AutofocusSample(
+                frame.timestamp_s,
+                error,
+                0.0,
+                current_z,
+                current_z,
+                total_intensity,
+                False,
+                False,
+                self._state,
+                (time.monotonic() - loop_start) * 1e3,
+                "error outside calibration domain",
+            )
+
         if config.lock_setpoint:
+            focus_error = self._calibration_error_at_focus()
+            # ROI-dependent background/aberration can shift the raw second-moment
+            # error baseline. Lock the per-ROI bias at engagement so calibration
+            # remains reusable across targets while preserving zero correction at
+            # the current Z when lock starts.
+            if self._setpoint_error is None:
+                self._setpoint_error = error - focus_error
             error -= self._setpoint_error
         elif config.recenter_alpha > 0:
+            if self._setpoint_error is None:
+                self._setpoint_error = error
             self._setpoint_error = config.recenter_alpha * self._setpoint_error + (1.0 - config.recenter_alpha) * error
             error -= self._setpoint_error
+        else:
+            self._setpoint_error = None
 
         error_um = self._calibration.error_to_z_offset_um(error)
         if not math.isfinite(float(error_um)):
@@ -306,7 +365,7 @@ class AstigmaticAutofocusController:
 
         if abs(correction) <= config.command_deadband_um:
             self._state = AutofocusState.LOCKED
-            return AutofocusSample(frame.timestamp_s, error, error_um, current_z, current_z, total_intensity, False, True, self._state, (time.monotonic() - loop_start) * 1e3)
+            return AutofocusSample(frame.timestamp_s, error, error_um, current_z, current_z, total_intensity, False, True, self._state, (time.monotonic() - loop_start) * 1e3, "within deadband")
 
         raw_target = current_z + correction
         slew_target = self._slew_limit(raw_target, dt_s, current_z, config)
@@ -333,6 +392,7 @@ class AstigmaticAutofocusController:
             confidence_ok=True,
             state=self._state,
             loop_latency_ms=(time.monotonic() - loop_start) * 1e3,
+            diagnostic="control update applied",
         )
 
     def run(self, duration_s: float) -> list[AutofocusSample]:
