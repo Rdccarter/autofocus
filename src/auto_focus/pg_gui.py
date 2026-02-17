@@ -336,7 +336,7 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
             controls.addWidget(w)
 
         self._rotation = QtWidgets.QComboBox()
-        self._rotation.addItems(["Rotate 0°", "Rotate 90°", "Rotate 180°", "Rotate 270°"])
+        self._rotation.addItems(["Rotate 0Â°", "Rotate 90Â°", "Rotate 180Â°", "Rotate 270Â°"])
         self._flip_h = QtWidgets.QCheckBox("Flip horizontal")
         self._flip_v = QtWidgets.QCheckBox("Flip vertical")
         controls.addWidget(self._rotation)
@@ -430,7 +430,7 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
         self._history_corr.append(corr)
         self._last_cmd = sample.commanded_z_um
 
-        self._z_lbl.setText(f"Z: {sample.commanded_z_um:+.3f} µm")
+        self._z_lbl.setText(f"Z: {sample.commanded_z_um:+.3f} Âµm")
         self._corr_lbl.setText(f"Last correction: {corr*1000.0:+.1f} nm")
         self._lat_lbl.setText(f"Loop latency: {sample.loop_latency_ms:.1f} ms")
         self._conf_lbl.setText(f"Confidence: {'good' if sample.confidence_ok else 'low'}")
@@ -480,14 +480,46 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
                 roi = self._controller.get_config_snapshot().roi
                 center = float(self._stage.get_z_um())
 
-                def _wait_for_new_frame(last_seq: int, timeout_s: float = 1.0):
-                    deadline = time.monotonic() + max(0.05, timeout_s)
-                    while time.monotonic() < deadline:
+                def _wait_for_settled_frame(last_seq: int, settle_s: float, move_time_s: float, timeout_s: float = 2.0):
+                    """Wait for both settle time and a fresh frame in one loop.
+
+                    Blocks until at least `settle_s` has elapsed since
+                    `move_time_s` AND a new frame (seq > last_seq) is
+                    available, whichever comes last.  This avoids the
+                    stop-and-go cadence from separate sleep + frame-wait.
+                    """
+                    settle_deadline = move_time_s + settle_s
+                    timeout_deadline = time.monotonic() + max(0.05, timeout_s)
+                    while time.monotonic() < timeout_deadline:
+                        now = time.monotonic()
+                        settled = now >= settle_deadline
                         frame, seq = self._frame_queue.get_latest()
-                        if frame is not None and seq > last_seq:
+                        if settled and frame is not None and seq > last_seq:
                             return frame, seq
                         time.sleep(0.005)
-                    raise RuntimeError("Timed out waiting for camera frame during calibration")
+                    raise RuntimeError("Timed out waiting for settled camera frame during calibration")
+
+                def _moment_sigma(patch) -> tuple[float, float]:
+                    """Moment-based sigma fallback for GUI calibration."""
+                    try:
+                        import numpy as _np
+                        arr = _np.asarray(patch, dtype=float)
+                        if arr.ndim != 2 or arr.size == 0:
+                            return (float("nan"), float("nan"))
+                        total = float(arr.sum())
+                        if total <= 0:
+                            return (float("nan"), float("nan"))
+                        y_idx, x_idx = _np.indices(arr.shape, dtype=float)
+                        cx = float((x_idx * arr).sum() / total)
+                        cy = float((y_idx * arr).sum() / total)
+                        var_x = float((((x_idx - cx) ** 2) * arr).sum() / total)
+                        var_y = float((((y_idx - cy) ** 2) * arr).sum() / total)
+                        import math as _m
+                        sx = _m.sqrt(var_x) if var_x > 0 else float("nan")
+                        sy = _m.sqrt(var_y) if var_y > 0 else float("nan")
+                        return (sx, sy)
+                    except Exception:
+                        return (float("nan"), float("nan"))
 
                 def _collect_and_check(*, half_range_um: float, n_steps: int, settle_s: float):
                     if n_steps < 2:
@@ -504,14 +536,13 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
 
                     for i, target_z in enumerate(targets):
                         self._stage.move_z_um(target_z)
-                        if settle_s > 0:
-                            time.sleep(settle_s)
+                        move_finished_s = time.monotonic()
                         measured_z = target_z
                         try:
                             measured_z = float(self._stage.get_z_um())
                         except Exception:
                             pass
-                        frame, last_seq = _wait_for_new_frame(last_seq)
+                        frame, last_seq = _wait_for_settled_frame(last_seq, settle_s, move_finished_s)
                         err = astigmatic_error_signal(frame.image, roi)
                         weight = roi_total_intensity(frame.image, roi)
                         samples_local.append(CalibrationSample(z_um=measured_z, error=err, weight=max(0.0, weight)))
@@ -524,7 +555,10 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
                             ell = gauss.ellipticity
                             fit_r2 = gauss.r_squared
                         else:
-                            sx = sy = ell = fit_r2 = float("nan")
+                            # Moment-based fallback: still usable by Zhuang fitter
+                            sx, sy = _moment_sigma(patch)
+                            ell = sx / sy if sy > 0 else float("nan")
+                            fit_r2 = float("nan")  # mark as moment fallback
                         zhuang_samples_local.append(
                             ZhuangCalibrationSample(
                                 z_um=measured_z,
