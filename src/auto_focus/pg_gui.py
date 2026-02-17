@@ -269,6 +269,12 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
         self._history_corr = deque(maxlen=400)
         self._last_cmd = None
         self._image_levels: tuple[float, float] | None = None
+        self._display_domain: tuple[float, float] = (0.0, 1.0)
+        self._display_level_min: float = 0.0
+        self._display_level_max: float = 1.0
+        self._display_autoscale: bool = True
+        self._gamma: float = 1.0
+        self._suspend_level_sync: bool = False
         self._frame_transform = FrameTransformState()
 
         self._controller = AstigmaticAutofocusController(
@@ -304,12 +310,17 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
         self._view.addItem(self._img)
         self._roi = pg.RectROI([self._config.roi.x, self._config.roi.y], [self._config.roi.width, self._config.roi.height], pen=pg.mkPen('c', width=2))
         self._view.addItem(self._roi)
+        self._hist = pg.HistogramLUTWidget()
+        self._hist.setImageItem(self._img)
         self._state_badge = QtWidgets.QLabel("CALIBRATED_READY")
         self._state_badge.setStyleSheet("background:#444;color:white;padding:4px;font-weight:bold;")
 
         left_panel = QtWidgets.QVBoxLayout()
         left_panel.addWidget(self._state_badge)
-        left_panel.addWidget(self._graphics)
+        image_row = QtWidgets.QHBoxLayout()
+        image_row.addWidget(self._graphics, 4)
+        image_row.addWidget(self._hist, 1)
+        left_panel.addLayout(image_row)
         top.addLayout(left_panel, 3)
 
         controls = QtWidgets.QVBoxLayout()
@@ -338,6 +349,28 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
         self._deadband = QtWidgets.QDoubleSpinBox(); self._deadband.setValue(self._config.command_deadband_um); self._deadband.setPrefix("Deadband ")
         for w in [self._kp, self._ki, self._kd, self._max_speed, self._max_step, self._deadband]:
             controls.addWidget(w)
+
+        self._track_roi_xy = QtWidgets.QCheckBox("Track ROI in XY")
+        self._track_roi_xy.setChecked(False)
+        self._track_gain = QtWidgets.QDoubleSpinBox(); self._track_gain.setRange(0.0, 1.0); self._track_gain.setSingleStep(0.05); self._track_gain.setValue(0.4); self._track_gain.setPrefix("Track gain ")
+        self._track_deadband_px = QtWidgets.QDoubleSpinBox(); self._track_deadband_px.setRange(0.0, 50.0); self._track_deadband_px.setValue(1.5); self._track_deadband_px.setPrefix("Track deadband px ")
+        self._track_max_step_px = QtWidgets.QDoubleSpinBox(); self._track_max_step_px.setRange(0.5, 100.0); self._track_max_step_px.setValue(8.0); self._track_max_step_px.setPrefix("Track max step px ")
+
+        self._autoscale_btn = QtWidgets.QPushButton("Autoscale")
+        self._level_min_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal); self._level_min_slider.setRange(0, 1000); self._level_min_slider.setValue(0)
+        self._level_max_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal); self._level_max_slider.setRange(0, 1000); self._level_max_slider.setValue(1000)
+        self._gamma_spin = QtWidgets.QDoubleSpinBox(); self._gamma_spin.setRange(0.2, 4.0); self._gamma_spin.setSingleStep(0.05); self._gamma_spin.setValue(1.0); self._gamma_spin.setPrefix("Gamma ")
+
+        controls.addWidget(self._track_roi_xy)
+        controls.addWidget(self._track_gain)
+        controls.addWidget(self._track_deadband_px)
+        controls.addWidget(self._track_max_step_px)
+        controls.addWidget(self._autoscale_btn)
+        controls.addWidget(QtWidgets.QLabel("Min level"))
+        controls.addWidget(self._level_min_slider)
+        controls.addWidget(QtWidgets.QLabel("Max level"))
+        controls.addWidget(self._level_max_slider)
+        controls.addWidget(self._gamma_spin)
 
         self._rotation = QtWidgets.QComboBox()
         self._rotation.addItems(["Rotate 0Â°", "Rotate 90Â°", "Rotate 180Â°", "Rotate 270Â°"])
@@ -379,6 +412,10 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
         self._rotation.currentIndexChanged.connect(self._on_transform_changed)
         self._flip_h.toggled.connect(self._on_transform_changed)
         self._flip_v.toggled.connect(self._on_transform_changed)
+        self._autoscale_btn.clicked.connect(self._on_autoscale_clicked)
+        self._level_min_slider.valueChanged.connect(self._on_level_slider_changed)
+        self._level_max_slider.valueChanged.connect(self._on_level_slider_changed)
+        self._gamma_spin.valueChanged.connect(self._on_gamma_changed)
 
     def _on_transform_changed(self, *_args) -> None:
         rotation = int(self._rotation.currentIndex()) * 90
@@ -398,29 +435,153 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
         roi = (max(0, int(pos.x())), max(0, int(pos.y())), max(1, int(size.x())), max(1, int(size.y())))
         self._signals.roi_changed.emit(roi)
 
+
+    def _roi_center_from_patch(self, patch) -> tuple[float, float] | None:
+        try:
+            import numpy as np
+
+            arr = np.asarray(patch, dtype=float)
+            if arr.ndim != 2 or arr.size == 0:
+                return None
+            total = float(np.sum(arr))
+            if total <= 0:
+                return None
+            y_idx, x_idx = np.indices(arr.shape, dtype=float)
+            cx = float(np.sum(x_idx * arr) / total)
+            cy = float(np.sum(y_idx * arr) / total)
+            return cx, cy
+        except Exception:
+            return None
+
+    def _track_roi_if_enabled(self, arr) -> None:
+        if not self._track_roi_xy.isChecked():
+            return
+        pos = self._roi.pos()
+        size = self._roi.size()
+        roi = Roi(
+            x=max(0, int(pos.x())),
+            y=max(0, int(pos.y())),
+            width=max(1, int(size.x())),
+            height=max(1, int(size.y())),
+        )
+        patch = extract_roi(arr, roi)
+        centroid = self._roi_center_from_patch(patch)
+        if centroid is None:
+            return
+        cx, cy = centroid
+        target_cx = (roi.width - 1) / 2.0
+        target_cy = (roi.height - 1) / 2.0
+        dx = cx - target_cx
+        dy = cy - target_cy
+        deadband = float(self._track_deadband_px.value())
+        if abs(dx) <= deadband and abs(dy) <= deadband:
+            return
+
+        gain = float(self._track_gain.value())
+        max_step = float(self._track_max_step_px.value())
+        shift_x = max(-max_step, min(max_step, gain * dx))
+        shift_y = max(-max_step, min(max_step, gain * dy))
+
+        h, w = arr.shape
+        new_x = float(max(0.0, min(w - roi.width, roi.x + shift_x)))
+        new_y = float(max(0.0, min(h - roi.height, roi.y + shift_y)))
+
+        if abs(new_x - pos.x()) < 0.1 and abs(new_y - pos.y()) < 0.1:
+            return
+
+        self._roi.setPos((new_x, new_y), update=True)
+        self._emit_roi_change()
+
+    def _sync_level_sliders_from_levels(self) -> None:
+        lo_dom, hi_dom = self._display_domain
+        span = max(1e-9, hi_dom - lo_dom)
+        self._suspend_level_sync = True
+        self._level_min_slider.setValue(int(max(0, min(1000, round((self._display_level_min - lo_dom) / span * 1000.0)))))
+        self._level_max_slider.setValue(int(max(0, min(1000, round((self._display_level_max - lo_dom) / span * 1000.0)))))
+        self._suspend_level_sync = False
+
+    def _sync_levels_from_sliders(self) -> None:
+        lo_dom, hi_dom = self._display_domain
+        span = max(1e-9, hi_dom - lo_dom)
+        s_min = int(self._level_min_slider.value())
+        s_max = int(self._level_max_slider.value())
+        if s_min >= s_max:
+            if self.sender() is self._level_min_slider:
+                s_max = min(1000, s_min + 1)
+                self._suspend_level_sync = True
+                self._level_max_slider.setValue(s_max)
+                self._suspend_level_sync = False
+            else:
+                s_min = max(0, s_max - 1)
+                self._suspend_level_sync = True
+                self._level_min_slider.setValue(s_min)
+                self._suspend_level_sync = False
+        self._display_level_min = lo_dom + (s_min / 1000.0) * span
+        self._display_level_max = lo_dom + (s_max / 1000.0) * span
+
+    def _on_autoscale_clicked(self) -> None:
+        self._display_autoscale = True
+
+    def _on_level_slider_changed(self, _value: int) -> None:
+        if self._suspend_level_sync:
+            return
+        self._display_autoscale = False
+        self._sync_levels_from_sliders()
+
+    def _on_gamma_changed(self, value: float) -> None:
+        self._gamma = max(0.2, float(value))
+
+    def _apply_gamma_lut(self) -> None:
+        try:
+            import numpy as np
+
+            gamma = max(0.2, float(self._gamma))
+            x = np.linspace(0.0, 1.0, 256, dtype=float)
+            y = np.power(x, 1.0 / gamma)
+            lut = np.clip(np.round(y * 255.0), 0, 255).astype(np.ubyte)
+            self._img.setLookupTable(lut)
+        except Exception:
+            pass
+
     @Slot(object)
     def _on_frame(self, frame: CameraFrame) -> None:
         try:
             import numpy as np
+
             arr = np.asarray(frame.image)
             if arr.ndim == 3 and 1 in arr.shape:
                 arr = np.squeeze(arr)
             if arr.ndim != 2:
                 raise ValueError(f"Camera frame must be 2D (received shape={arr.shape!r})")
 
-            if arr.dtype.kind in ("f", "c"):
-                finite = arr[np.isfinite(arr)]
-                if finite.size:
-                    lo = float(np.min(finite))
-                    hi = float(np.max(finite))
-                    if lo == hi:
-                        hi = lo + 1.0
-                    self._image_levels = (lo, hi)
-                elif self._image_levels is None:
-                    self._image_levels = (0.0, 1.0)
-                self._img.setImage(arr, autoLevels=False, levels=self._image_levels)
+            arr = np.asarray(arr, dtype=float)
+            finite = arr[np.isfinite(arr)]
+            if finite.size:
+                lo = float(np.min(finite))
+                hi = float(np.max(finite))
             else:
-                self._img.setImage(arr, autoLevels=False)
+                lo, hi = 0.0, 1.0
+            if hi <= lo:
+                hi = lo + 1.0
+
+            self._display_domain = (lo, hi)
+            if self._display_autoscale:
+                self._display_level_min = lo
+                self._display_level_max = hi
+                self._sync_level_sliders_from_levels()
+            else:
+                self._sync_levels_from_sliders()
+
+            if self._display_level_max <= self._display_level_min:
+                self._display_level_max = self._display_level_min + 1e-6
+
+            self._apply_gamma_lut()
+            self._img.setImage(
+                arr,
+                autoLevels=False,
+                levels=(self._display_level_min, self._display_level_max),
+            )
+            self._track_roi_if_enabled(arr)
         except Exception as exc:
             self._signals.fault.emit(f"Display failure: {exc}")
 
