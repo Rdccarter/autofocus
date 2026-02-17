@@ -17,12 +17,15 @@ from .calibration import (
     CalibrationMetadata,
     CalibrationSample,
     FocusCalibration,
+    ZhuangCalibrationSample,
     calibration_quality_issues,
     fit_linear_calibration_with_report,
+    fit_zhuang_calibration,
     save_calibration_metadata_json,
     save_calibration_samples_csv,
+    save_zhuang_calibration_samples_csv,
 )
-from .focus_metric import Roi, astigmatic_error_signal, roi_total_intensity
+from .focus_metric import Roi, astigmatic_error_signal, extract_roi, fit_gaussian_psf, roi_total_intensity
 from .interfaces import CameraFrame, CameraInterface, StageInterface
 from .ui_signals import AutofocusSignals
 
@@ -52,14 +55,82 @@ class RunStats:
     faults: list[str] | None = None
 
 
+
+
+@dataclass(slots=True)
+class FrameTransformState:
+    rotation_deg: int = 0
+    flip_h: bool = False
+    flip_v: bool = False
+
+    def __post_init__(self) -> None:
+        self._lock = threading.Lock()
+
+    def set(self, *, rotation_deg: int | None = None, flip_h: bool | None = None, flip_v: bool | None = None) -> None:
+        with self._lock:
+            if rotation_deg is not None:
+                self.rotation_deg = int(rotation_deg) % 360
+            if flip_h is not None:
+                self.flip_h = bool(flip_h)
+            if flip_v is not None:
+                self.flip_v = bool(flip_v)
+
+    def get(self) -> tuple[int, bool, bool]:
+        with self._lock:
+            return self.rotation_deg, self.flip_h, self.flip_v
+
+
+def _apply_frame_transform(frame: CameraFrame, transform: FrameTransformState) -> CameraFrame:
+    rotation_deg, flip_h, flip_v = transform.get()
+    if rotation_deg % 360 == 0 and (not flip_h) and (not flip_v):
+        return frame
+
+    image = frame.image
+    try:
+        import numpy as np
+
+        arr = np.asarray(image)
+        if arr.ndim == 3 and 1 in arr.shape:
+            arr = np.squeeze(arr)
+        if arr.ndim != 2:
+            raise ValueError(f"Camera frame must be 2D (received shape={arr.shape!r})")
+
+        k = (rotation_deg // 90) % 4
+        if k:
+            arr = np.rot90(arr, k=k)
+        if flip_h:
+            arr = np.fliplr(arr)
+        if flip_v:
+            arr = np.flipud(arr)
+        return CameraFrame(image=arr.copy(), timestamp_s=frame.timestamp_s)
+    except ImportError:
+        if hasattr(image, "tolist") and callable(image.tolist):
+            image = image.tolist()
+        if isinstance(image, tuple):
+            image = list(image)
+        if not isinstance(image, list) or not image or not isinstance(image[0], (list, tuple)):
+            raise ValueError("Camera frame must be 2D")
+        rows = [list(r) for r in image]
+
+        k = (rotation_deg // 90) % 4
+        for _ in range(k):
+            rows = [list(col) for col in zip(*rows[::-1])]
+        if flip_h:
+            rows = [row[::-1] for row in rows]
+        if flip_v:
+            rows = rows[::-1]
+        return CameraFrame(image=rows, timestamp_s=frame.timestamp_s)
+
+
 class CameraWorker(threading.Thread):
-    def __init__(self, camera: CameraInterface, frame_queue: LatestFrameQueue, signals: AutofocusSignals, stop_evt: threading.Event):
+    def __init__(self, camera: CameraInterface, frame_queue: LatestFrameQueue, signals: AutofocusSignals, stop_evt: threading.Event, transform: FrameTransformState):
         super().__init__(daemon=True)
         self._camera = camera
         self._queue = frame_queue
         self._signals = signals
         self._stop_evt = stop_evt
         self._pause_evt = threading.Event()
+        self._transform = transform
 
     def pause(self) -> None:
         self._pause_evt.set()
@@ -74,7 +145,8 @@ class CameraWorker(threading.Thread):
                 continue
             try:
                 frame = self._camera.get_frame()
-                self._queue.put(frame)
+                oriented = _apply_frame_transform(_normalize_frame(frame), self._transform)
+                self._queue.put(oriented)
                 latest, _ = self._queue.get_latest()
                 if latest is not None:
                     self._signals.frame_ready.emit(latest)
@@ -197,6 +269,7 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
         self._history_corr = deque(maxlen=400)
         self._last_cmd = None
         self._image_levels: tuple[float, float] | None = None
+        self._frame_transform = FrameTransformState()
 
         self._controller = AstigmaticAutofocusController(
             camera=self._camera,
@@ -212,7 +285,7 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
         self._signals.config_changed.connect(self._af_worker.update_config, QtCore.Qt.QueuedConnection)
         self._af_thread.start()
 
-        self._camera_worker = CameraWorker(self._camera, self._frame_queue, self._signals, self._stop_evt)
+        self._camera_worker = CameraWorker(self._camera, self._frame_queue, self._signals, self._stop_evt, self._frame_transform)
 
         self._build_ui()
         self._connect_signals()
@@ -266,6 +339,14 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
         for w in [self._kp, self._ki, self._kd, self._max_speed, self._max_step, self._deadband]:
             controls.addWidget(w)
 
+        self._rotation = QtWidgets.QComboBox()
+        self._rotation.addItems(["Rotate 0°", "Rotate 90°", "Rotate 180°", "Rotate 270°"])
+        self._flip_h = QtWidgets.QCheckBox("Flip horizontal")
+        self._flip_v = QtWidgets.QCheckBox("Flip vertical")
+        controls.addWidget(self._rotation)
+        controls.addWidget(self._flip_h)
+        controls.addWidget(self._flip_v)
+
         top.addLayout(controls, 1)
 
         self._plot = pg.PlotWidget(title="Diagnostics (10s)")
@@ -295,6 +376,18 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
         self._max_speed.valueChanged.connect(
             lambda v: self._queue_config_update(max_slew_rate_um_per_s=(None if v <= 0 else float(v)))
         )
+        self._rotation.currentIndexChanged.connect(self._on_transform_changed)
+        self._flip_h.toggled.connect(self._on_transform_changed)
+        self._flip_v.toggled.connect(self._on_transform_changed)
+
+    def _on_transform_changed(self, *_args) -> None:
+        rotation = int(self._rotation.currentIndex()) * 90
+        self._frame_transform.set(
+            rotation_deg=rotation,
+            flip_h=self._flip_h.isChecked(),
+            flip_v=self._flip_v.isChecked(),
+        )
+        self._image_levels = None
 
     def _queue_config_update(self, **values) -> None:
         self._signals.config_changed.emit(values)
@@ -410,6 +503,7 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
                     targets = forward_targets + list(reversed(forward_targets))
 
                     samples_local: list[CalibrationSample] = []
+                    zhuang_samples_local: list[ZhuangCalibrationSample] = []
                     _, last_seq = self._frame_queue.get_latest()
 
                     for i, target_z in enumerate(targets):
@@ -425,13 +519,38 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
                         err = astigmatic_error_signal(frame.image, roi)
                         weight = roi_total_intensity(frame.image, roi)
                         samples_local.append(CalibrationSample(z_um=measured_z, error=err, weight=max(0.0, weight)))
+
+                        patch = extract_roi(frame.image, roi)
+                        gauss = fit_gaussian_psf(patch)
+                        if gauss is not None and gauss.r_squared > 0.3:
+                            sx = gauss.sigma_x
+                            sy = gauss.sigma_y
+                            ell = gauss.ellipticity
+                            fit_r2 = gauss.r_squared
+                        else:
+                            sx = sy = ell = fit_r2 = float("nan")
+                        zhuang_samples_local.append(
+                            ZhuangCalibrationSample(
+                                z_um=measured_z,
+                                error=err,
+                                weight=max(0.0, weight),
+                                sigma_x=sx,
+                                sigma_y=sy,
+                                ellipticity=ell,
+                                fit_r2=fit_r2,
+                            )
+                        )
                         self._signals.status.emit(f"Calibrating {i+1}/{len(targets)}")
 
-                    report_local = fit_linear_calibration_with_report(samples_local, robust=True)
-                    issues_local = calibration_quality_issues(samples_local, report_local)
-                    return samples_local, report_local, issues_local
+                    try:
+                        z_report = fit_zhuang_calibration(zhuang_samples_local)
+                        return zhuang_samples_local, z_report.calibration, [], "zhuang"
+                    except Exception:
+                        report_local = fit_linear_calibration_with_report(samples_local, robust=True)
+                        issues_local = calibration_quality_issues(samples_local, report_local)
+                        return zhuang_samples_local, report_local.calibration, issues_local, "linear"
 
-                samples, report, issues = _collect_and_check(
+                samples, calibration_fit, issues, cal_mode = _collect_and_check(
                     half_range_um=self._calibration_half_range_um,
                     n_steps=self._calibration_steps,
                     settle_s=0.05,
@@ -444,21 +563,24 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
                     )
                     retry_half_range = max(0.05, self._calibration_half_range_um * 0.8)
                     retry_steps = max(self._calibration_steps + 10, int(self._calibration_steps * 1.5))
-                    samples_retry, report_retry, issues_retry = _collect_and_check(
+                    samples_retry, calibration_retry, issues_retry, mode_retry = _collect_and_check(
                         half_range_um=retry_half_range,
                         n_steps=retry_steps,
                         settle_s=0.15,
                     )
                     if len(issues_retry) < len(issues):
-                        samples, report, issues = samples_retry, report_retry, issues_retry
+                        samples, calibration_fit, issues, cal_mode = samples_retry, calibration_retry, issues_retry, mode_retry
 
                 if issues:
                     self._signals.fault.emit("Calibration failed: " + "; ".join(issues))
                     return
-                self._calibration = report.calibration
+                self._calibration = calibration_fit
                 self._controller.calibration = self._calibration
                 out = Path(self._calibration_output_path)
-                save_calibration_samples_csv(out, samples)
+                if cal_mode == "zhuang":
+                    save_zhuang_calibration_samples_csv(out, samples)
+                else:
+                    save_calibration_samples_csv(out, [CalibrationSample(z_um=s.z_um, error=s.error, weight=s.weight) for s in samples])
                 meta = CalibrationMetadata(
                     roi_size=(roi.width, roi.height),
                     stage_type=type(self._stage).__name__,

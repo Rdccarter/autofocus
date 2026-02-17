@@ -81,7 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--allow-missing-calibration", action="store_true", help="Allow runtime with default calibration when no calibration file exists")
-    parser.add_argument("--calibration-model", choices=["linear", "poly2", "piecewise"], default="linear", help="Calibration fit model")
+    parser.add_argument("--calibration-model", choices=["zhuang", "linear", "poly2", "piecewise"], default="zhuang", help="Calibration fit model (zhuang preferred by default)")
     parser.add_argument(
         "--calibration-expected-slope",
         choices=["auto", "positive", "negative"],
@@ -148,7 +148,8 @@ def _load_startup_calibration(
     if not zhuang_loaded:
         # Fall back to linear calibration
         samples = load_calibration_samples_csv(csv_path)
-        report = fit_calibration_model(samples, model=model, robust=True)
+        fallback_model = "linear" if model == "zhuang" else model
+        report = fit_calibration_model(samples, model=fallback_model, robust=True)
         calibration = report.calibration
         print(
             "Loaded linear calibration "
