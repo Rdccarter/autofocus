@@ -174,6 +174,8 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
         calibration: FocusCalibration,
         default_config: AutofocusConfig,
         calibration_output_path: str | None = None,
+        calibration_half_range_um: float = 0.75,
+        calibration_steps: int = 21,
     ) -> None:
         super().__init__()
         self.setWindowTitle("Autofocus Instrument Panel")
@@ -182,6 +184,8 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
         self._calibration = calibration
         self._config = default_config
         self._calibration_output_path = calibration_output_path or "calibration_sweep.csv"
+        self._calibration_half_range_um = max(0.05, float(calibration_half_range_um))
+        self._calibration_steps = max(5, int(calibration_steps))
 
         self._signals = AutofocusSignals()
         self._stop_evt = threading.Event()
@@ -387,16 +391,42 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
                 self._camera_worker.pause()
                 roi = self._controller.get_config_snapshot().roi
                 center = float(self._stage.get_z_um())
-                samples = auto_calibrate(
-                    self._camera,
-                    self._stage,
-                    roi,
-                    z_min_um=center - 0.75,
-                    z_max_um=center + 0.75,
-                    n_steps=21,
+
+                def _collect_and_check(*, half_range_um: float, n_steps: int, settle_s: float):
+                    samples_local = auto_calibrate(
+                        self._camera,
+                        self._stage,
+                        roi,
+                        z_min_um=center - half_range_um,
+                        z_max_um=center + half_range_um,
+                        n_steps=n_steps,
+                        settle_s=settle_s,
+                    )
+                    report_local = fit_linear_calibration_with_report(samples_local, robust=True)
+                    issues_local = calibration_quality_issues(samples_local, report_local)
+                    return samples_local, report_local, issues_local
+
+                samples, report, issues = _collect_and_check(
+                    half_range_um=self._calibration_half_range_um,
+                    n_steps=self._calibration_steps,
+                    settle_s=0.05,
                 )
-                report = fit_linear_calibration_with_report(samples, robust=True)
-                issues = calibration_quality_issues(samples, report)
+
+                mismatch_issue = "up/down sweep mismatch is high"
+                if issues and any(mismatch_issue in issue for issue in issues):
+                    self._signals.status.emit(
+                        "Calibration retry: detected up/down mismatch, rerunning with slower settle and finer sweep"
+                    )
+                    retry_half_range = max(0.05, self._calibration_half_range_um * 0.8)
+                    retry_steps = max(self._calibration_steps + 10, int(self._calibration_steps * 1.5))
+                    samples_retry, report_retry, issues_retry = _collect_and_check(
+                        half_range_um=retry_half_range,
+                        n_steps=retry_steps,
+                        settle_s=0.15,
+                    )
+                    if len(issues_retry) < len(issues):
+                        samples, report, issues = samples_retry, report_retry, issues_retry
+
                 if issues:
                     self._signals.fault.emit("Calibration failed: " + "; ".join(issues))
                     return
@@ -444,6 +474,8 @@ def launch_pg_autofocus_gui(
     calibration: FocusCalibration,
     default_config: AutofocusConfig,
     calibration_output_path: str | None = None,
+    calibration_half_range_um: float = 0.75,
+    calibration_steps: int = 21,
 ) -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     win = AutofocusMainWindow(
@@ -452,6 +484,8 @@ def launch_pg_autofocus_gui(
         calibration=calibration,
         default_config=default_config,
         calibration_output_path=calibration_output_path,
+        calibration_half_range_um=calibration_half_range_um,
+        calibration_steps=calibration_steps,
     )
     win.resize(1280, 860)
     win.start()

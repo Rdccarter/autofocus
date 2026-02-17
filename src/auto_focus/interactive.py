@@ -17,7 +17,7 @@ def launch_autofocus_viewer(
     calibration_steps: int = 21,
 ) -> None:
     """Launch the PyQtGraph autofocus GUI."""
-    _ = (interval_ms, calibration_half_range_um, calibration_steps)
+    _ = interval_ms
     from .pg_gui import launch_pg_autofocus_gui
 
     launch_pg_autofocus_gui(
@@ -26,6 +26,8 @@ def launch_autofocus_viewer(
         calibration=calibration,
         default_config=default_config,
         calibration_output_path=calibration_output_path,
+        calibration_half_range_um=calibration_half_range_um,
+        calibration_steps=calibration_steps,
     )
 
 
