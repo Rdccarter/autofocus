@@ -9,7 +9,7 @@ from typing import Callable
 
 from .calibration import FocusCalibration, ZhuangFocusCalibration
 from .focus_metric import Roi, astigmatic_error_signal, centroid_near_edge, roi_total_intensity
-from .interfaces import CameraInterface, StageInterface
+from .interfaces import CameraFrame, CameraInterface, StageInterface
 
 # Either calibration type works — both provide error_to_z_offset_um().
 CalibrationLike = FocusCalibration | ZhuangFocusCalibration
@@ -181,9 +181,10 @@ class AstigmaticAutofocusController:
                 return False
         return True
 
-    def run_step(self, dt_s: float | None = None) -> AutofocusSample:
+    def run_step(self, dt_s: float | None = None, frame: CameraFrame | None = None) -> AutofocusSample:
         loop_start = time.monotonic()
-        frame = self._camera.get_frame()
+        if frame is None:
+            frame = self._camera.get_frame()
         current_z = self._stage.get_z_um()
         if self._z_lock_center_um is None:
             self._z_lock_center_um = float(current_z)
