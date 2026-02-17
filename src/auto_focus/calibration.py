@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import csv
+import json
 import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+import numpy as np
+
 
 from .focus_metric import Roi, astigmatic_error_signal, roi_total_intensity, fit_gaussian_psf
 from .interfaces import CameraInterface, StageInterface
@@ -40,9 +43,29 @@ class FocusCalibration:
 
     error_at_focus: float
     error_to_um: float
+    error_min: float | None = None
+    error_max: float | None = None
 
     def error_to_z_offset_um(self, error: float) -> float:
         return (error - self.error_at_focus) * self.error_to_um
+
+    def is_error_in_range(self, error: float, margin: float = 0.0) -> bool:
+        if self.error_min is None or self.error_max is None:
+            return True
+        return (self.error_min - margin) <= error <= (self.error_max + margin)
+
+
+@dataclass(slots=True)
+class CalibrationMetadata:
+    objective: str = ""
+    roi_size: tuple[int, int] | None = None
+    exposure_ms: float | None = None
+    wavelength_nm: float | None = None
+    camera_roi: tuple[int, int, int, int] | None = None
+    camera_binning: str | None = None
+    stage_type: str | None = None
+    temperature_c: float | None = None
+    created_at_unix_s: float = 0.0
 
 
 @dataclass(slots=True)
@@ -61,6 +84,8 @@ class CalibrationFitReport:
     n_samples: int
     n_inliers: int
     robust: bool
+    recommended_z_range_um: tuple[float, float]
+    hysteresis_um: float
 
 
 
@@ -174,6 +199,16 @@ def _robust_seed_fit(samples: list[CalibrationSample], *, max_pairs: int = 500) 
     return best
 
 
+
+
+def _estimate_bidirectional_hysteresis(samples: list[CalibrationSample]) -> float:
+    z_to_errors: dict[float, list[float]] = {}
+    for s in samples:
+        key = round(float(s.z_um), 3)
+        z_to_errors.setdefault(key, []).append(float(s.error))
+    hysteresis_deltas = [max(v) - min(v) for v in z_to_errors.values() if len(v) > 1]
+    return max(hysteresis_deltas) if hysteresis_deltas else 0.0
+
 def _fit_report(
     samples: list[CalibrationSample],
     slope: float,
@@ -184,7 +219,13 @@ def _fit_report(
     metric_samples: list[CalibrationSample] | None = None,
 ) -> CalibrationFitReport:
     error_at_focus = -intercept / slope
-    cal = FocusCalibration(error_at_focus=error_at_focus, error_to_um=slope)
+    errors = [s.error for s in samples]
+    cal = FocusCalibration(
+        error_at_focus=error_at_focus,
+        error_to_um=slope,
+        error_min=min(errors),
+        error_max=max(errors),
+    )
 
     metric_samples = samples if metric_samples is None else metric_samples
     weights = [max(0.0, s.weight) for s in metric_samples]
@@ -210,6 +251,8 @@ def _fit_report(
         n_samples=len(samples),
         n_inliers=n_inliers,
         robust=robust,
+        recommended_z_range_um=(min(s.z_um for s in samples), max(s.z_um for s in samples)),
+        hysteresis_um=_estimate_bidirectional_hysteresis(samples),
     )
 
 
@@ -659,13 +702,13 @@ def fit_zhuang_calibration(
             f"need at least 10. Check ROI placement and PSF quality."
         )
 
-    z = _np().array([s.z_um for s in good])
-    sx = _np().array([s.sigma_x for s in good]) * pixel_size_um
-    sy = _np().array([s.sigma_y for s in good]) * pixel_size_um
+    z = np.array([s.z_um for s in good])
+    sx = np.array([s.sigma_x for s in good]) * pixel_size_um
+    sy = np.array([s.sigma_y for s in good]) * pixel_size_um
     ell = sx / sy
 
     # Center Z for fitting
-    z_center = float(_np().mean(z))
+    z_center = float(np.mean(z))
     z_local = z - z_center
 
     # Fit individual axes
@@ -714,11 +757,6 @@ def fit_zhuang_calibration(
     )
 
 
-def _np():
-    """Lazy numpy import."""
-    import numpy as np
-    return np
-
 
 def save_zhuang_calibration_samples_csv(
     path: str | Path,
@@ -757,3 +795,116 @@ def load_zhuang_calibration_samples_csv(path: str | Path) -> list[ZhuangCalibrat
                 fit_r2=float(row.get("fit_r2", "nan")),
             ))
     return out
+
+
+def fit_calibration_model(
+    samples: list[CalibrationSample],
+    *,
+    model: str = "linear",
+    robust: bool = False,
+    outlier_threshold_um: float = 0.2,
+) -> CalibrationFitReport:
+    """Fit calibration with selectable model (linear/poly2/piecewise).
+
+    Non-linear modes currently use a local-linear approximation around focus
+    for runtime control compatibility and report residual quality gates.
+    """
+    if model == "linear":
+        return fit_linear_calibration_with_report(samples, robust=robust, outlier_threshold_um=outlier_threshold_um)
+
+    if model == "poly2":
+        ss = _sanitize_calibration_samples(samples)
+        z_reference_um = _weighted_z_reference(ss)
+        centered = _center_samples_on_reference(ss, z_reference_um)
+        n = len(centered)
+        sum_w = sum(max(0.0, s.weight) for s in ss)
+        if sum_w <= 0:
+            raise ValueError("Calibration sample weights must contain positive mass")
+
+        # Weighted quadratic model in local (centered) Z frame.
+        e = [s.error for s in centered]
+        z = [s.z_um for s in centered]
+        w = [max(0.0, s.weight) for s in centered]
+        X = np.vstack([np.array(e) ** 2, np.array(e), np.ones(n)]).T
+        W = np.diag(np.array(w))
+        beta = np.linalg.pinv(X.T @ W @ X) @ (X.T @ W @ np.array(z))
+        a, b, c = [float(v) for v in beta]
+
+        # Estimate focus error e0 from z(e)=0 roots; choose root nearest weighted median error.
+        if abs(a) < 1e-12:
+            if abs(b) < 1e-12:
+                raise ValueError("Polynomial calibration is degenerate near focus")
+            e0 = -c / b
+        else:
+            disc = (b * b) - (4.0 * a * c)
+            if disc < 0.0:
+                e0 = sorted(e)[n // 2]
+            else:
+                sqrt_disc = math.sqrt(disc)
+                r1 = (-b + sqrt_disc) / (2.0 * a)
+                r2 = (-b - sqrt_disc) / (2.0 * a)
+                e_med = sorted(e)[n // 2]
+                e0 = r1 if abs(r1 - e_med) <= abs(r2 - e_med) else r2
+
+        # Linearize around estimated focus so runtime control stays compatible
+        # with the linear mapping interface.
+        slope = 2.0 * a * e0 + b
+        if slope == 0.0:
+            slope = b if b != 0 else 1e-6
+        intercept = -slope * e0
+        return _fit_report(centered, slope, intercept, robust=robust, n_inliers=len(centered))
+
+    if model == "piecewise":
+        ss = _sanitize_calibration_samples(samples)
+        z_reference_um = _weighted_z_reference(ss)
+        centered = sorted(_center_samples_on_reference(ss, z_reference_um), key=lambda s: s.error)
+        mid = len(centered) // 2
+        left = centered[: max(2, mid)]
+        right = centered[max(0, mid - 1):]
+        l_slope, l_int = _weighted_linear_fit(left)
+        r_slope, r_int = _weighted_linear_fit(right)
+
+        # Estimate focus error from line intersection and collapse to one local slope.
+        if abs(l_slope - r_slope) < 1e-12:
+            e0 = centered[mid].error
+        else:
+            e0 = (r_int - l_int) / (l_slope - r_slope)
+
+        slope = 0.5 * (l_slope + r_slope)
+        z0 = 0.5 * ((l_slope * e0 + l_int) + (r_slope * e0 + r_int))
+        intercept = z0 - slope * e0
+        return _fit_report(centered, slope, intercept, robust=robust, n_inliers=len(centered))
+
+    raise ValueError(f"Unsupported model: {model}")
+
+
+def save_calibration_metadata_json(path: str | Path, metadata: CalibrationMetadata) -> None:
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "objective": metadata.objective,
+        "roi_size": list(metadata.roi_size) if metadata.roi_size is not None else None,
+        "exposure_ms": metadata.exposure_ms,
+        "wavelength_nm": metadata.wavelength_nm,
+        "camera_roi": list(metadata.camera_roi) if metadata.camera_roi is not None else None,
+        "camera_binning": metadata.camera_binning,
+        "stage_type": metadata.stage_type,
+        "temperature_c": metadata.temperature_c,
+        "created_at_unix_s": metadata.created_at_unix_s or time.time(),
+    }
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def load_calibration_metadata_json(path: str | Path) -> CalibrationMetadata:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    return CalibrationMetadata(
+        objective=str(payload.get("objective", "")),
+        roi_size=tuple(payload["roi_size"]) if payload.get("roi_size") is not None else None,
+        exposure_ms=payload.get("exposure_ms"),
+        wavelength_nm=payload.get("wavelength_nm"),
+        camera_roi=tuple(payload["camera_roi"]) if payload.get("camera_roi") is not None else None,
+        camera_binning=payload.get("camera_binning"),
+        stage_type=payload.get("stage_type"),
+        temperature_c=payload.get("temperature_c"),
+        created_at_unix_s=float(payload.get("created_at_unix_s", 0.0)),
+    )

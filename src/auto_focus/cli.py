@@ -8,6 +8,7 @@ from .autofocus import AstigmaticAutofocusController, AutofocusConfig
 from .calibration import (
     FocusCalibration,
     calibration_quality_issues,
+    fit_calibration_model,
     fit_linear_calibration_with_report,
     fit_zhuang_calibration,
     load_calibration_samples_csv,
@@ -38,7 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Camera backend selection",
     )
     parser.add_argument(
-        "--camera-index", type=int, default=0, help="Camera index for pylablib backend"
+        "--camera-index", type=int, default=0, help="Camera index (DCAM idx / Andor camera_index) for pylablib backend"
     )
     parser.add_argument("--mm-host", default="localhost", help="Micro-Manager pycromanager host")
     parser.add_argument("--mm-port", type=int, default=4827, help="Micro-Manager pycromanager port")
@@ -65,11 +66,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--kp", type=float, default=0.8, help="Proportional gain")
     parser.add_argument("--ki", type=float, default=0.2, help="Integral gain")
-    parser.add_argument("--max-step", type=float, default=0.2, help="Max correction step in Âµm")
-    parser.add_argument("--command-deadband-um", type=float, default=0.02, help="Ignore stage corrections smaller than this magnitude (Âµm) to reduce oscillation")
-    parser.add_argument("--stage-min-um", type=float, default=None, help="Lower clamp for commanded stage Z (Âµm)")
-    parser.add_argument("--stage-max-um", type=float, default=None, help="Upper clamp for commanded stage Z (Âµm)")
-    parser.add_argument("--af-max-excursion-um", type=float, default=5.0, help="Max allowed autofocus excursion from initial Z lock point (Âµm); set negative to disable")
+    parser.add_argument("--max-step", type=float, default=0.2, help="Max correction step in µm")
+    parser.add_argument("--command-deadband-um", type=float, default=0.02, help="Ignore stage corrections smaller than this magnitude (µm) to reduce oscillation")
+    parser.add_argument("--stage-min-um", type=float, default=None, help="Lower clamp for commanded stage Z (µm)")
+    parser.add_argument("--stage-max-um", type=float, default=None, help="Upper clamp for commanded stage Z (µm)")
+    parser.add_argument("--af-max-excursion-um", type=float, default=5.0, help="Max allowed autofocus excursion from initial Z lock point (µm); set negative to disable")
     parser.add_argument(
         "--calibration-csv",
         default="calibration_sweep.csv",
@@ -78,22 +79,24 @@ def build_parser() -> argparse.ArgumentParser:
             "focus calibration automatically; GUI calibration sweeps also write to this path."
         ),
     )
+    parser.add_argument("--allow-missing-calibration", action="store_true", help="Allow runtime with default calibration when no calibration file exists")
+    parser.add_argument("--calibration-model", choices=["linear", "poly2", "piecewise"], default="linear", help="Calibration fit model")
     parser.add_argument(
         "--calibration-half-range-um",
         type=float,
         default=0.75,
-        help="Half-range around current Z for napari calibration sweep",
+        help="Half-range around current Z for GUI calibration sweep",
     )
     parser.add_argument(
         "--calibration-steps",
         type=int,
         default=21,
-        help="Number of Z points for napari calibration sweep",
+        help="Number of Z points for GUI calibration sweep",
     )
     return parser
 
 
-def _load_startup_calibration(samples_csv: str | None) -> FocusCalibration:
+def _load_startup_calibration(samples_csv: str | None, *, model: str = "linear") -> FocusCalibration:
     if not samples_csv:
         raise ValueError(
             "Calibration CSV path is required. Provide --calibration-csv to reuse a saved sweep."
@@ -133,7 +136,7 @@ def _load_startup_calibration(samples_csv: str | None) -> FocusCalibration:
     if not zhuang_loaded:
         # Fall back to linear calibration
         samples = load_calibration_samples_csv(csv_path)
-        report = fit_linear_calibration_with_report(samples, robust=True)
+        report = fit_calibration_model(samples, model=model, robust=True)
         calibration = FocusCalibration(
             error_at_focus=0.0,
             error_to_um=report.calibration.error_to_um,
@@ -243,7 +246,8 @@ def _build_camera_and_stage(args):
 
     # pylablib camera (orca / andor) + package-controlled stage
     stage = _build_stage(args)
-    frame_source = create_pylablib_frame_source(args.camera, idx=args.camera_index)
+    camera_kwargs = {"idx": args.camera_index} if args.camera == "orca" else {"camera_index": args.camera_index}
+    frame_source = create_pylablib_frame_source(args.camera, **camera_kwargs)
     camera = HamamatsuOrcaCamera(frame_source=frame_source, control_source_lifecycle=True)
     return camera, stage
 
@@ -271,9 +275,9 @@ def main() -> int:
             command_deadband_um=args.command_deadband_um,
         )
         try:
-            calibration = _load_startup_calibration(args.calibration_csv)
+            calibration = _load_startup_calibration(args.calibration_csv, model=args.calibration_model)
         except ValueError as exc:
-            if not args.show_live:
+            if (not args.show_live) or (not args.allow_missing_calibration):
                 raise
             print(f"Warning: {exc}", file=sys.stderr)
             print(
