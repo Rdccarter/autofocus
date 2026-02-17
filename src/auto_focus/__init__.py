@@ -4,10 +4,12 @@ from .autofocus import (
     AstigmaticAutofocusController,
     AutofocusConfig,
     AutofocusSample,
+    AutofocusState,
     AutofocusWorker,
 )
 from .calibration import (
     CalibrationFitReport,
+    CalibrationMetadata,
     CalibrationSample,
     FocusCalibration,
     ZhuangCalibrationReport,
@@ -15,14 +17,17 @@ from .calibration import (
     ZhuangFocusCalibration,
     auto_calibrate,
     auto_calibrate_zhuang,
+    fit_calibration_model,
     fit_linear_calibration,
     fit_linear_calibration_with_report,
     fit_zhuang_calibration,
     load_calibration_samples_csv,
     load_zhuang_calibration_samples_csv,
+    save_calibration_metadata_json,
     save_calibration_samples_csv,
     save_zhuang_calibration_samples_csv,
     validate_calibration_sign,
+    load_calibration_metadata_json,
 )
 from .dcam import DcamFrameSource
 from .focus_metric import GaussianPsfResult, Roi, centroid_near_edge, fit_gaussian_psf
@@ -45,17 +50,22 @@ __all__ = [
     "AstigmaticAutofocusController",
     "AutofocusConfig",
     "AutofocusSample",
+    "AutofocusState",
     "AutofocusWorker",
     # Linear calibration
     "CalibrationFitReport",
+    "CalibrationMetadata",
     "CalibrationSample",
     "FocusCalibration",
     "auto_calibrate",
+    "fit_calibration_model",
     "fit_linear_calibration",
     "fit_linear_calibration_with_report",
+    "save_calibration_metadata_json",
     "save_calibration_samples_csv",
     "load_calibration_samples_csv",
     "validate_calibration_sign",
+    "load_calibration_metadata_json",
     # Zhuang calibration
     "ZhuangCalibrationReport",
     "ZhuangCalibrationSample",
