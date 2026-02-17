@@ -286,13 +286,14 @@ def find_z_from_ellipticity(
     return z
 
 
-def _find_zhuang_usable_range(q: np.ndarray) -> tuple[float, float] | None:
+def _find_zhuang_usable_range(q: np.ndarray, search_half_range_um: float = 5.0) -> tuple[float, float] | None:
     """Find the monotonic range of the ellipticity curve near focus.
 
     Returns (z_min, z_max) or None if range cannot be determined.
     """
     z0 = q[1]  # center of focus
-    z_test = np.linspace(z0 - 2.0, z0 + 2.0, 2000)
+    half = max(0.5, float(search_half_range_um))
+    z_test = np.linspace(z0 - half, z0 + half, 3000)
     e_test = zhuang_ellipticity(z_test, q)
 
     valid = np.isfinite(e_test) & (e_test > 0)
