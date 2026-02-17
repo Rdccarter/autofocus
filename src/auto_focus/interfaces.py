@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 
-Image2D = list[list[float]]
+# Accept list-based images and NumPy-like arrays to avoid expensive
+# list<->ndarray conversion churn on high-rate camera streams.
+Image2D = list[list[float]] | Any
 
 
 @dataclass(slots=True)
