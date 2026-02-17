@@ -16,6 +16,7 @@ from .zhuang import (
     ZhuangEllipticityParams,
     ZhuangLookupTable,
     ZhuangParams,
+    build_empirical_lookup_table,
     build_lookup_table,
     fit_zhuang_axis,
     fit_zhuang_ellipticity,
@@ -160,7 +161,7 @@ def _robust_seed_fit(samples: list[CalibrationSample], *, max_pairs: int = 500) 
         raise ValueError("Need at least two calibration samples")
 
     # Deterministic subsample: spread evenly across error-sorted samples to
-    # avoid O(n²) blowup while still covering the full error range.  Using a
+    # avoid O(nÂ²) blowup while still covering the full error range.  Using a
     # deterministic selection keeps the seed (and therefore the inlier set and
     # final calibration) reproducible across runs on the same data.
     if len(samples) > 80:
@@ -281,9 +282,9 @@ def fit_linear_calibration_with_report(
 
     slope, intercept = _weighted_linear_fit(centered_samples)
     n_inliers = len(centered_samples)
-    # The samples used for R²/RMSE metrics must match the samples used for
+    # The samples used for RÂ²/RMSE metrics must match the samples used for
     # the fit; otherwise the quality gate is unreliable and calibrations
-    # that look good by R² can still produce bad control behavior.
+    # that look good by RÂ² can still produce bad control behavior.
     fit_inliers = centered_samples
 
     if robust:
@@ -533,14 +534,23 @@ def validate_calibration_sign(
 
 @dataclass(slots=True)
 class ZhuangCalibrationSample:
-    """Calibration sample with Gaussian PSF fit data for Zhuang model."""
+    """Calibration sample with Gaussian PSF fit data for Zhuang model.
+
+    When the parametric Gaussian fit succeeds (R² > 0.3), sigma_x/sigma_y
+    come from the fitted parameters and fit_r2 is the parametric R².
+
+    When the parametric fit fails, sigma_x/sigma_y are estimated from
+    intensity-weighted second moments and fit_r2 is set to NaN to mark
+    these as moment-based fallback estimates.  Downstream code should
+    treat finite sigma with non-finite fit_r2 as usable but lower-confidence.
+    """
     z_um: float
     error: float          # second-moment error signal
     weight: float
-    sigma_x: float        # fitted Gaussian sigma_x (pixels)
-    sigma_y: float        # fitted Gaussian sigma_y (pixels)
+    sigma_x: float        # Gaussian sigma_x (pixels); parametric or moment fallback
+    sigma_y: float        # Gaussian sigma_y (pixels); parametric or moment fallback
     ellipticity: float    # sigma_x / sigma_y
-    fit_r2: float         # Gaussian fit R²
+    fit_r2: float         # Gaussian fit R²; NaN for moment-based fallback
 
 
 @dataclass(slots=True)
@@ -555,7 +565,7 @@ class ZhuangFocusCalibration:
     params_x: ZhuangParams
     params_y: ZhuangParams
     lookup: ZhuangLookupTable
-    pixel_size_um: float = 1.0  # px→um conversion for sigma values
+    pixel_size_um: float = 1.0  # pxâ†’um conversion for sigma values
 
     # These two fields maintain interface compatibility with FocusCalibration
     error_at_focus: float = 0.0
@@ -582,6 +592,35 @@ class ZhuangCalibrationReport:
     n_good_fits: int
     usable_range_um: tuple[float, float] | None
     linear_slope: float  # approximate slope at focus for comparison
+
+
+def _moment_sigma_fallback(patch) -> tuple[float, float]:
+    """Estimate sigma_x, sigma_y from intensity-weighted second moments.
+
+    Used as a fallback when the parametric Gaussian fit fails (low R² or
+    convergence issues).  Returns (sigma_x, sigma_y) in pixels.  If the
+    patch has no signal, returns (NaN, NaN).
+    """
+    try:
+        arr = np.asarray(patch, dtype=float)
+    except Exception:
+        return (math.nan, math.nan)
+    if arr.ndim != 2 or arr.size == 0:
+        return (math.nan, math.nan)
+
+    total = float(arr.sum())
+    if total <= 0:
+        return (math.nan, math.nan)
+
+    y_idx, x_idx = np.indices(arr.shape, dtype=float)
+    cx = float((x_idx * arr).sum() / total)
+    cy = float((y_idx * arr).sum() / total)
+    var_x = float((((x_idx - cx) ** 2) * arr).sum() / total)
+    var_y = float((((y_idx - cy) ** 2) * arr).sum() / total)
+
+    sx = math.sqrt(var_x) if var_x > 0 else math.nan
+    sy = math.sqrt(var_y) if var_y > 0 else math.nan
+    return (sx, sy)
 
 
 def auto_calibrate_zhuang(
@@ -656,7 +695,13 @@ def auto_calibrate_zhuang(
             ell = gauss.ellipticity
             fit_r2 = gauss.r_squared
         else:
-            sx = sy = ell = fit_r2 = math.nan
+            # Moment-based fallback: extract sigma from second moments of the
+            # ROI patch so the sample is still usable by the Zhuang fitter even
+            # when the parametric Gaussian fit fails.  fit_r2 is explicitly NaN
+            # to mark these as fallback estimates.
+            sx, sy = _moment_sigma_fallback(patch)
+            ell = sx / sy if sy > 0 else math.nan
+            fit_r2 = math.nan  # mark as moment fallback, not parametric fit
 
         if on_step is not None:
             on_step(step_index, total_steps, target_z, measured_z, True)
@@ -688,17 +733,26 @@ def fit_zhuang_calibration(
     Args:
         samples: From auto_calibrate_zhuang()
         pixel_size_um: Camera pixel size in um (to convert sigma from px to um)
-        min_fit_r2: Minimum R² of individual Gaussian fits to include
+        min_fit_r2: Minimum R² of individual Gaussian fits to include.
+            Samples with finite sigma_x/sigma_y but non-finite fit_r2
+            (moment-based fallback) are also accepted.
 
     Returns:
         ZhuangCalibrationReport with the calibration and quality metrics.
     """
-    # Filter to samples with good Gaussian fits
-    good = [s for s in samples if math.isfinite(s.sigma_x) and s.fit_r2 >= min_fit_r2]
+    # Accept samples that either:
+    #  (a) have a good parametric Gaussian fit (R² >= min_fit_r2), or
+    #  (b) have finite sigma_x/sigma_y from the moment-based fallback
+    #      (fit_r2 is NaN, meaning no parametric fit was obtained).
+    parametric = [s for s in samples if math.isfinite(s.sigma_x) and math.isfinite(s.fit_r2) and s.fit_r2 >= min_fit_r2]
+    moment_fallback = [s for s in samples if math.isfinite(s.sigma_x) and math.isfinite(s.sigma_y) and not math.isfinite(s.fit_r2)]
+    good = parametric + moment_fallback
 
     if len(good) < 10:
         raise ValueError(
-            f"Only {len(good)} samples had good Gaussian fits (R² >= {min_fit_r2}); "
+            f"Only {len(good)} usable samples "
+            f"({len(parametric)} parametric R² >= {min_fit_r2}, "
+            f"{len(moment_fallback)} moment-fallback with finite sigma); "
             f"need at least 10. Check ROI placement and PSF quality."
         )
 
@@ -721,18 +775,65 @@ def fit_zhuang_calibration(
     # Refine ellipticity model by fitting directly to ellipticity data
     ell_params, _, _ = fit_zhuang_ellipticity(z_local, ell, initial=ell_params)
 
-    # Build lookup table for fast runtime use
-    lookup = build_lookup_table(ell_params)
+    usable_range = zhuang_usable_range(ell_params)
 
-    # Compute approximate linear slope at focus for diagnostics
+    # Build empirical lookup table from the actual measured second-moment
+    # error signal rather than the theoretical (ell²-1)/(ell²+1) conversion.
+    # The raw ROI second-moment metric can differ in scale from the ideal
+    # Gaussian prediction due to noise, background, and truncation effects,
+    # so the lookup must match what astigmatic_error_signal() produces at
+    # runtime.
+    sweep_z_local = np.array([s.z_um for s in samples]) - z_center
+    sweep_error = np.array([s.error for s in samples])
+
+    # Determine focus Z from the first ellipticity crossing near 1.0.
+    # In an astigmatic system, the first Z where ell≈1.0 (swept from min Z)
+    # is the true inter-focal midpoint. A global argmin(|ell-1|) can pick
+    # spurious flat regions at the sweep edges, so we scan in Z-sorted order
+    # and accept the first local minimum within tolerance.
+    ell_all = np.array([s.ellipticity for s in samples])
+    z_all_local = np.array([s.z_um for s in samples]) - z_center
+    ell_finite = np.isfinite(ell_all)
+    if ell_finite.sum() > 0:
+        z_order = np.argsort(z_all_local[ell_finite])
+        ell_sorted = ell_all[ell_finite][z_order]
+        z_sorted = z_all_local[ell_finite][z_order]
+        dist_to_1 = np.abs(ell_sorted - 1.0)
+        window = max(3, len(dist_to_1) // 30)
+        z_focus_local = float(z_sorted[np.argmin(dist_to_1)])  # fallback: global min
+        for i in range(window, len(dist_to_1) - window):
+            local = dist_to_1[max(0, i - window):i + window + 1]
+            if dist_to_1[i] == local.min() and dist_to_1[i] < 0.3:
+                z_focus_local = float(z_sorted[i])
+                break
+    else:
+        z_focus_local = 0.0
+
+    try:
+        lookup = build_empirical_lookup_table(
+            sweep_z_local, sweep_error, z_focus_local,
+        )
+    except ValueError:
+        # Fall back to theoretical lookup if empirical fails
+        lookup = build_lookup_table(ell_params)
+
+    # Compute approximate linear slope at focus from the empirical lookup
+    # (how many um of Z per unit of actual error signal near focus).
     dz = 0.01
-    e_plus = second_moment_error_from_ellipticity(
-        float(zhuang_ellipticity(dz, ell_params))
-    )
-    e_minus = second_moment_error_from_ellipticity(
-        float(zhuang_ellipticity(-dz, ell_params))
-    )
-    linear_slope = 2 * dz / (e_plus - e_minus) if e_plus != e_minus else 1.0
+    sort_idx = np.argsort(sweep_z_local)
+    e_at_plus = float(np.interp(z_focus_local + dz, sweep_z_local[sort_idx],
+                                 sweep_error[sort_idx]))
+    e_at_minus = float(np.interp(z_focus_local - dz, sweep_z_local[sort_idx],
+                                  sweep_error[sort_idx]))
+    if e_at_plus != e_at_minus:
+        linear_slope = 2 * dz / (e_at_plus - e_at_minus)
+    else:
+        linear_slope = 1.0
+
+    # Empirical error at focus for diagnostics
+    focus_error = float(np.interp(z_focus_local,
+                                  sweep_z_local[np.argsort(sweep_z_local)],
+                                  sweep_error[np.argsort(sweep_z_local)]))
 
     cal = ZhuangFocusCalibration(
         params=ell_params,
@@ -740,9 +841,13 @@ def fit_zhuang_calibration(
         params_y=params_y,
         lookup=lookup,
         pixel_size_um=pixel_size_um,
-        error_at_focus=0.0,
+        error_at_focus=focus_error,
         error_to_um=linear_slope,
     )
+
+    # Report the effective usable range from the empirical lookup (if used),
+    # since the Zhuang model's theoretical range may not overlap the data.
+    effective_range = lookup.z_range if hasattr(lookup, 'z_range') else zhuang_usable_range(ell_params)
 
     return ZhuangCalibrationReport(
         calibration=cal,
@@ -752,7 +857,7 @@ def fit_zhuang_calibration(
         chi2_y=chi2_y,
         n_samples=len(samples),
         n_good_fits=len(good),
-        usable_range_um=zhuang_usable_range(ell_params),
+        usable_range_um=effective_range,
         linear_slope=linear_slope,
     )
 

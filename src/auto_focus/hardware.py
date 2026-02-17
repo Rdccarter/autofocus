@@ -225,6 +225,47 @@ class MclNanoZStage(StageInterface):
         self._z_um = value
         return value
 
+    def get_range_um(self) -> tuple[float, float] | None:
+        """Query the hardware travel range for this axis.
+
+        Returns (min_um, max_um) or None if the range cannot be determined.
+        MCL piezos always start at 0; max is read from MCL_GetCalibration.
+        """
+        # Try wrapper first
+        if self._wrapper is not None:
+            handle = self._wrapper_handle
+            for name in ("get_range_um", "get_calibration", "MCL_GetCalibration"):
+                fn = getattr(self._wrapper, name, None)
+                if not callable(fn):
+                    continue
+                for args in ((self._axis, handle), (self._axis,), (handle,), ()):
+                    try:
+                        result = fn(*args)
+                        if isinstance(result, (tuple, list)) and len(result) == 2:
+                            return (float(result[0]), float(result[1]))
+                        val = float(result)
+                        if val > 0:
+                            return (0.0, val)
+                    except (TypeError, ValueError, AttributeError):
+                        continue
+            return None
+
+        # Try DLL MCL_GetCalibration(axis, handle) -> double (max travel in um)
+        if self._dll is not None and self._handle is not None:
+            get_cal = getattr(self._dll, "MCL_GetCalibration", None)
+            if get_cal is not None:
+                try:
+                    get_cal.restype = ctypes.c_double
+                    max_um = float(get_cal(ctypes.c_uint(self._axis), ctypes.c_int(self._handle)))
+                    if max_um > 0:
+                        return (0.0, max_um)
+                except Exception:
+                    pass
+            return None
+
+        # Simulated stage: no hardware limits
+        return None
+
     def move_z_um(self, target_z_um: float) -> None:
         if self._wrapper is not None:
             self._wrapper_write_z(target_z_um)

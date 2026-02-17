@@ -67,11 +67,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--kp", type=float, default=0.8, help="Proportional gain")
     parser.add_argument("--ki", type=float, default=0.2, help="Integral gain")
-    parser.add_argument("--max-step", type=float, default=0.2, help="Max correction step in µm")
-    parser.add_argument("--command-deadband-um", type=float, default=0.02, help="Ignore stage corrections smaller than this magnitude (µm) to reduce oscillation")
-    parser.add_argument("--stage-min-um", type=float, default=None, help="Lower clamp for commanded stage Z (µm)")
-    parser.add_argument("--stage-max-um", type=float, default=None, help="Upper clamp for commanded stage Z (µm)")
-    parser.add_argument("--af-max-excursion-um", type=float, default=5.0, help="Max allowed autofocus excursion from initial Z lock point (µm); set negative to disable")
+    parser.add_argument("--max-step", type=float, default=0.2, help="Max correction step in Âµm")
+    parser.add_argument("--command-deadband-um", type=float, default=0.005, help="Ignore stage corrections smaller than this magnitude (Âµm) to reduce oscillation")
+    parser.add_argument("--stage-min-um", type=float, default=None, help="Lower clamp for commanded stage Z (Âµm)")
+    parser.add_argument("--stage-max-um", type=float, default=None, help="Upper clamp for commanded stage Z (Âµm)")
+    parser.add_argument("--af-max-excursion-um", type=float, default=5.0, help="Max allowed autofocus excursion from initial Z lock point (Âµm); set negative to disable")
     parser.add_argument(
         "--calibration-csv",
         default="calibration_sweep.csv",
@@ -136,9 +136,9 @@ def _load_startup_calibration(
                 rng = zhuang_report.usable_range_um
                 print(
                     f"Loaded Zhuang calibration ({csv_path}): "
-                    f"R²(σx)={zhuang_report.r2_x:.3f}, R²(σy)={zhuang_report.r2_y:.3f}, "
-                    f"range=[{rng[0]:+.3f}, {rng[1]:+.3f}] µm, "
-                    f"linear_slope≈{zhuang_report.linear_slope:+.4f} um/error, "
+                    f"RÂ²(Ïƒx)={zhuang_report.r2_x:.3f}, RÂ²(Ïƒy)={zhuang_report.r2_y:.3f}, "
+                    f"range=[{rng[0]:+.3f}, {rng[1]:+.3f}] Âµm, "
+                    f"linear_slopeâ‰ˆ{zhuang_report.linear_slope:+.4f} um/error, "
                     f"good_fits={zhuang_report.n_good_fits}/{zhuang_report.n_samples}",
                     file=sys.stderr,
                 )
@@ -146,7 +146,7 @@ def _load_startup_calibration(
             else:
                 print(
                     f"Warning: Zhuang fit quality too low "
-                    f"(R²_x={zhuang_report.r2_x:.3f}, R²_y={zhuang_report.r2_y:.3f}, "
+                    f"(RÂ²_x={zhuang_report.r2_x:.3f}, RÂ²_y={zhuang_report.r2_y:.3f}, "
                     f"usable_range={zhuang_report.usable_range_um}, "
                     f"good_fits={zhuang_report.n_good_fits}/{zhuang_report.n_samples}); "
                     f"falling back to linear.",

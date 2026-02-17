@@ -474,11 +474,42 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
         self._queue_config_update(lock_setpoint=bool(enabled))
 
     def _run_calibration(self) -> None:
+        # Read ROI directly from the widget on the GUI thread so the
+        # calibration always uses exactly what is drawn on screen, even if
+        # a queued roi_changed signal hasn't been processed by the AF worker yet.
+        pos = self._roi.pos()
+        size = self._roi.size()
+        gui_roi = Roi(
+            x=max(0, int(pos.x())),
+            y=max(0, int(pos.y())),
+            width=max(1, int(size.x())),
+            height=max(1, int(size.y())),
+        )
+        # Push the same ROI to the controller so post-calibration autofocus
+        # uses the identical region.
+        self._signals.roi_changed.emit((gui_roi.x, gui_roi.y, gui_roi.width, gui_roi.height))
+
         def _task() -> None:
             try:
                 QtCore.QMetaObject.invokeMethod(self._af_worker, "stop_loop", QtCore.Qt.QueuedConnection)
-                roi = self._controller.get_config_snapshot().roi
+                roi = gui_roi
                 center = float(self._stage.get_z_um())
+
+                # Determine stage travel limits for sweep clamping.
+                stage_range: tuple[float, float] | None = None
+                get_range = getattr(self._stage, "get_range_um", None)
+                if callable(get_range):
+                    try:
+                        stage_range = get_range()
+                    except Exception:
+                        pass
+                # Fall back to config-level clamps if hardware query unavailable
+                config_snap = self._controller.get_config_snapshot()
+                if stage_range is None:
+                    lo = config_snap.stage_min_um
+                    hi = config_snap.stage_max_um
+                    if lo is not None or hi is not None:
+                        stage_range = (lo if lo is not None else -1e9, hi if hi is not None else 1e9)
 
                 def _wait_for_settled_frame(last_seq: int, settle_s: float, move_time_s: float, timeout_s: float = 2.0):
                     """Wait for both settle time and a fresh frame in one loop.
@@ -526,16 +557,41 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
                         raise ValueError("n_steps must be >= 2")
                     z_min_um = center - half_range_um
                     z_max_um = center + half_range_um
+
+                    # Clamp sweep to stage travel limits to avoid out-of-range errors.
+                    if stage_range is not None:
+                        old_min, old_max = z_min_um, z_max_um
+                        z_min_um = max(z_min_um, stage_range[0])
+                        z_max_um = min(z_max_um, stage_range[1])
+                        if z_min_um != old_min or z_max_um != old_max:
+                            self._signals.status.emit(
+                                f"Sweep clamped to stage range [{z_min_um:.2f}, {z_max_um:.2f}] µm"
+                            )
+                    if z_max_um <= z_min_um:
+                        raise ValueError(
+                            f"Sweep range is empty after clamping to stage limits "
+                            f"(center={center:.2f}, half_range={half_range_um:.2f}, "
+                            f"stage_range={stage_range}). Move stage away from travel limit."
+                        )
+
                     step = (z_max_um - z_min_um) / float(n_steps - 1)
                     forward_targets = [z_min_um + i * step for i in range(n_steps)]
                     targets = forward_targets + list(reversed(forward_targets))
 
                     samples_local: list[CalibrationSample] = []
                     zhuang_samples_local: list[ZhuangCalibrationSample] = []
+                    failed_moves: list[tuple[float, Exception]] = []
                     _, last_seq = self._frame_queue.get_latest()
 
                     for i, target_z in enumerate(targets):
-                        self._stage.move_z_um(target_z)
+                        try:
+                            self._stage.move_z_um(target_z)
+                        except Exception as exc:
+                            failed_moves.append((target_z, exc))
+                            self._signals.status.emit(
+                                f"Calibrating {i+1}/{len(targets)} — skipped z={target_z:.3f} (move failed)"
+                            )
+                            continue
                         move_finished_s = time.monotonic()
                         measured_z = target_z
                         try:
@@ -571,6 +627,15 @@ class AutofocusMainWindow(QtWidgets.QMainWindow):
                             )
                         )
                         self._signals.status.emit(f"Calibrating {i+1}/{len(targets)}")
+
+                    if len(samples_local) < 2:
+                        if failed_moves:
+                            _, first_exc = failed_moves[0]
+                            raise RuntimeError(
+                                f"Calibration sweep failed: {len(samples_local)} succeeded, "
+                                f"{len(failed_moves)} moves failed. First: {first_exc}"
+                            )
+                        raise RuntimeError("Calibration sweep could not collect enough valid points.")
 
                     try:
                         z_report = fit_zhuang_calibration(zhuang_samples_local)

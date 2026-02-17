@@ -12,7 +12,7 @@ from .calibration import FocusCalibration, ZhuangFocusCalibration
 from .focus_metric import Roi, astigmatic_error_signal, centroid_near_edge, roi_total_intensity
 from .interfaces import CameraFrame, CameraInterface, StageInterface
 
-# Either calibration type works — both provide error_to_z_offset_um().
+# Either calibration type works â€” both provide error_to_z_offset_um().
 CalibrationLike = FocusCalibration | ZhuangFocusCalibration
 
 
@@ -61,7 +61,7 @@ class AutofocusConfig:
     edge_margin_px: float = 0.0
     # Do not issue stage moves smaller than this threshold (um) to reduce
     # high-frequency dithering/oscillation near focus.
-    command_deadband_um: float = 0.02
+    command_deadband_um: float = 0.005
     # Slew limit in um/s for commanded target changes.
     max_slew_rate_um_per_s: float | None = None
     # Setpoint locking + optional guarded recentering.

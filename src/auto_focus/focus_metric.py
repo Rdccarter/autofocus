@@ -77,6 +77,14 @@ def _astigmatic_error_signal_numpy(patch: Image2D) -> float:
         return _astigmatic_error_signal_python(patch)
 
     arr = np.asarray(patch, dtype=float)
+
+    # Background-subtract so uniform illumination doesn't dilute the
+    # intensity-weighted second moments.  Without this, background pixels
+    # compress the (var_x - var_y)/(var_x + var_y) ratio toward zero,
+    # making the error signal ~20× weaker than the Zhuang model expects.
+    bg = float(np.percentile(arr, 10))
+    arr = np.maximum(arr - bg, 0.0)
+
     total = float(arr.sum())
     if total <= 0:
         return 0.0
@@ -95,7 +103,16 @@ def _astigmatic_error_signal_numpy(patch: Image2D) -> float:
 
 
 def _astigmatic_error_signal_python(patch: Image2D) -> float:
-    total = sum(sum(row) for row in patch)
+    # Flatten to estimate background (10th percentile).
+    all_vals = sorted(v for row in patch for v in row)
+    if not all_vals:
+        return 0.0
+    bg = all_vals[max(0, len(all_vals) // 10)]
+
+    total = 0.0
+    for row in patch:
+        for val in row:
+            total += max(0.0, val - bg)
     if total <= 0:
         return 0.0
 
@@ -103,8 +120,9 @@ def _astigmatic_error_signal_python(patch: Image2D) -> float:
     sum_y = 0.0
     for y, row in enumerate(patch):
         for x, val in enumerate(row):
-            sum_x += x * val
-            sum_y += y * val
+            w = max(0.0, val - bg)
+            sum_x += x * w
+            sum_y += y * w
 
     cx = sum_x / total
     cy = sum_y / total
@@ -113,8 +131,9 @@ def _astigmatic_error_signal_python(patch: Image2D) -> float:
     var_y = 0.0
     for y, row in enumerate(patch):
         for x, val in enumerate(row):
-            var_x += ((x - cx) ** 2) * val
-            var_y += ((y - cy) ** 2) * val
+            w = max(0.0, val - bg)
+            var_x += ((x - cx) ** 2) * w
+            var_y += ((y - cy) ** 2) * w
 
     var_x /= total
     var_y /= total

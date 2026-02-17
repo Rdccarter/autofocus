@@ -328,7 +328,7 @@ def zhuang_usable_range(q: ZhuangEllipticityParams | np.ndarray) -> tuple[float,
 
 
 # ---------------------------------------------------------------------------
-# Second-moment metric ↔ Zhuang model bridge
+# Second-moment metric â†” Zhuang model bridge
 # ---------------------------------------------------------------------------
 
 def second_moment_error_from_ellipticity(ell: float) -> float:
@@ -345,7 +345,7 @@ def second_moment_error_from_ellipticity(ell: float) -> float:
 def ellipticity_from_second_moment_error(error: float) -> float:
     """Inverse: convert second-moment error signal to ellipticity ratio.
 
-    error = (ell^2 - 1)/(ell^2 + 1)  →  ell^2 = (1 + error)/(1 - error)
+    error = (ell^2 - 1)/(ell^2 + 1)  â†’  ell^2 = (1 + error)/(1 - error)
     """
     if error >= 1.0:
         return float("inf")
@@ -360,7 +360,7 @@ def ellipticity_from_second_moment_error(error: float) -> float:
 
 @dataclass(slots=True)
 class ZhuangLookupTable:
-    """Precomputed lookup table mapping second-moment error signal → z offset.
+    """Precomputed lookup table mapping second-moment error signal â†’ z offset.
 
     Built from a fitted Zhuang ellipticity model for fast runtime evaluation
     without iterative root-finding.
@@ -371,7 +371,7 @@ class ZhuangLookupTable:
     z_center: float           # z at error=0 (focus)
 
     def error_to_z_offset_um(self, error: float) -> float:
-        """Fast interpolated lookup: error signal → z offset in um."""
+        """Fast interpolated lookup: error signal â†’ z offset in um."""
         if len(self.error_values) < 2:
             return 0.0
         z = float(np.interp(error, self.error_values, self.z_offsets))
@@ -384,7 +384,9 @@ def build_lookup_table(
 ) -> ZhuangLookupTable:
     """Build a lookup table from a fitted Zhuang model.
 
-    Maps second-moment error signal to z offset for fast runtime use.
+    Maps *theoretical* second-moment error signal to z offset.  This is useful
+    for diagnostics, but for real-time control use ``build_empirical_lookup_table``
+    so the lookup matches the actual measured error signal from the ROI.
     """
     if isinstance(q, ZhuangEllipticityParams):
         q_arr = q.to_array()
@@ -422,3 +424,155 @@ def build_lookup_table(
         z_range=z_range,
         z_center=z_center,
     )
+
+
+def build_empirical_lookup_table(
+    z_data: np.ndarray,
+    error_data: np.ndarray,
+    z_focus: float,
+    n_bins: int = 60,
+    smooth_window: int = 7,
+) -> ZhuangLookupTable:
+    """Build a lookup table from actual calibration sweep measurements.
+
+    Unlike ``build_lookup_table`` which uses the theoretical second-moment error
+    derived from the Zhuang ellipticity model, this function uses the *measured*
+    second-moment error signal from the calibration sweep.  This ensures the
+    lookup matches the same ``astigmatic_error_signal()`` that the control loop
+    computes at runtime, avoiding the scale mismatch that occurs when the ROI
+    second-moment metric differs from the ideal Gaussian prediction.
+
+    The function bins and smooths the sweep data, then identifies the largest
+    monotonic arm of the error curve that contains ``z_focus``.
+
+    Args:
+        z_data: Z positions from calibration sweep.
+        error_data: Measured second-moment error at each Z.
+        z_focus: Z position of best focus (from Zhuang model or ellipticity).
+        n_bins: Number of bins for binning.
+        smooth_window: Moving-average window size for smoothing before
+            monotonic segment detection.
+
+    Returns:
+        ZhuangLookupTable using empirical error values.
+    """
+    z_data = np.asarray(z_data, dtype=float)
+    error_data = np.asarray(error_data, dtype=float)
+
+    mask = np.isfinite(z_data) & np.isfinite(error_data)
+    z_sel = z_data[mask]
+    err_sel = error_data[mask]
+
+    if len(z_sel) < 4:
+        raise ValueError(f"Only {len(z_sel)} finite samples; need at least 4.")
+
+    z_min, z_max = float(z_sel.min()), float(z_sel.max())
+    if z_max <= z_min:
+        raise ValueError("All Z values are identical")
+
+    # Bin by Z and average (reduces bidirectional hysteresis noise)
+    bin_edges = np.linspace(z_min, z_max, n_bins + 1)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    bin_errors = np.full(n_bins, np.nan)
+    for i in range(n_bins):
+        in_bin = (z_sel >= bin_edges[i]) & (z_sel < bin_edges[i + 1])
+        if i == n_bins - 1:
+            in_bin |= (z_sel == bin_edges[i + 1])
+        if np.any(in_bin):
+            bin_errors[i] = float(np.mean(err_sel[in_bin]))
+
+    # Interpolate empty bins
+    valid = np.isfinite(bin_errors)
+    if valid.sum() < 4:
+        raise ValueError("Too few non-empty bins for empirical lookup")
+    bin_errors = np.interp(bin_centers, bin_centers[valid], bin_errors[valid])
+
+    # Smooth with a moving average to remove noise before gradient analysis
+    kernel = np.ones(smooth_window) / smooth_window
+    padded = np.pad(bin_errors, smooth_window // 2, mode="edge")
+    smoothed = np.convolve(padded, kernel, mode="valid")[:n_bins]
+
+    # Find the main monotonic arm containing z_focus.
+    # Use the smoothed curve to find the turnaround (extremum) near z_focus.
+    de = np.diff(smoothed)
+    sign_changes = np.where(np.diff(np.sign(de)))[0]
+    extrema_z = bin_centers[sign_changes + 1] if len(sign_changes) > 0 else np.array([])
+
+    # Find segment boundaries around z_focus
+    below = extrema_z[extrema_z < z_focus]
+    above = extrema_z[extrema_z > z_focus]
+    seg_lo = float(below[-1]) if len(below) > 0 else z_min
+    seg_hi = float(above[0]) if len(above) > 0 else z_max
+
+    # Select bins in this segment
+    seg_mask = (bin_centers >= seg_lo) & (bin_centers <= seg_hi)
+    seg_z = bin_centers[seg_mask]
+    seg_err = smoothed[seg_mask]
+
+    # If the segment is too small, fall back to the largest monotonic segment
+    if len(seg_z) < 6:
+        segments = []
+        start = 0
+        for sc in sign_changes:
+            segments.append((start, sc + 1))
+            start = sc + 1
+        segments.append((start, len(de)))
+        # Pick the longest segment
+        best = max(segments, key=lambda s: s[1] - s[0])
+        seg_mask_fb = np.zeros(n_bins, dtype=bool)
+        seg_mask_fb[best[0]:min(best[1] + 1, n_bins)] = True
+        seg_z = bin_centers[seg_mask_fb]
+        seg_err = smoothed[seg_mask_fb]
+
+    if len(seg_z) < 2:
+        raise ValueError("Not enough valid points for empirical lookup")
+
+    # Enforce monotonicity via isotonic regression
+    if seg_err[-1] >= seg_err[0]:
+        seg_err = _isotonic_increasing(seg_err)
+    else:
+        seg_err = -_isotonic_increasing(-seg_err)
+
+    # Sort by error for np.interp
+    order = np.argsort(seg_err)
+    error_sorted = seg_err[order]
+    z_sorted = seg_z[order]
+
+    # z_center: find z corresponding to the error at z_focus
+    error_at_focus = float(np.interp(
+        np.clip(z_focus, seg_z[0], seg_z[-1]), seg_z, seg_err
+    ))
+    z_center = float(np.interp(error_at_focus, error_sorted, z_sorted))
+
+    z_range = (float(seg_z[0]), float(seg_z[-1]))
+
+    return ZhuangLookupTable(
+        error_values=error_sorted,
+        z_offsets=z_sorted,
+        z_range=z_range,
+        z_center=z_center,
+    )
+
+
+def _isotonic_increasing(y: np.ndarray) -> np.ndarray:
+    """Pool-adjacent-violators algorithm for monotone increasing fit."""
+    n = len(y)
+    result = y.astype(float).copy()
+    blocks = [[i] for i in range(n)]
+    i = 0
+    while i < len(blocks) - 1:
+        mean_curr = np.mean(result[blocks[i]])
+        mean_next = np.mean(result[blocks[i + 1]])
+        if mean_curr <= mean_next:
+            i += 1
+        else:
+            # Merge blocks
+            merged = blocks[i] + blocks[i + 1]
+            merged_mean = np.mean(result[merged])
+            for idx in merged:
+                result[idx] = merged_mean
+            blocks[i] = merged
+            blocks.pop(i + 1)
+            if i > 0:
+                i -= 1
+    return result
