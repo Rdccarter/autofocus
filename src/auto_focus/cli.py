@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -126,7 +127,7 @@ def _load_startup_calibration(
     try:
         zhuang_samples = load_zhuang_calibration_samples_csv(csv_path)
         has_gaussian = any(
-            __import__("math").isfinite(s.sigma_x) for s in zhuang_samples
+            math.isfinite(s.sigma_x) for s in zhuang_samples
         )
         if has_gaussian:
             zhuang_report = fit_zhuang_calibration(zhuang_samples)

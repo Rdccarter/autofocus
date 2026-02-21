@@ -4,6 +4,7 @@ import csv
 import json
 import math
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -109,6 +110,8 @@ def _sanitize_calibration_samples(samples: list[CalibrationSample]) -> list[Cali
         raise ValueError("Calibration samples are degenerate")
 
     return sanitized
+
+
 def _weighted_linear_fit(samples: list[CalibrationSample]) -> tuple[float, float]:
     if len(samples) < 2:
         raise ValueError("Need at least two calibration samples")
@@ -174,10 +177,11 @@ def _robust_seed_fit(samples: list[CalibrationSample], *, max_pairs: int = 500) 
     best: tuple[float, float] | None = None
     best_med = float("inf")
     pairs_checked = 0
-    for i in range(len(subset)):
-        for j in range(i + 1, len(subset)):
+    for gap in range(1, len(subset)):
+        for i in range(0, len(subset) - gap):
             if pairs_checked >= max_pairs:
                 break
+            j = i + gap
             e0 = subset[i].error
             e1 = subset[j].error
             if e1 == e0:
@@ -405,6 +409,14 @@ def auto_calibrate(
             "need at least 2 successful stage positions."
         )
 
+    fail_ratio = len(failed_moves) / total_steps if total_steps > 0 else 0.0
+    if fail_ratio > 0.2:
+        warnings.warn(
+            f"Calibration sweep completed with {len(failed_moves)}/{total_steps} failed stage moves; fit quality may be degraded.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
     return out
 
 
@@ -575,6 +587,14 @@ class ZhuangFocusCalibration:
         """Map second-moment error signal to z offset using Zhuang lookup."""
         return self.lookup.error_to_z_offset_um(error)
 
+    def is_error_in_range(self, error: float, margin: float = 0.0) -> bool:
+        values = self.lookup.error_values
+        if values.size < 2:
+            return True
+        lo = float(np.min(values)) - margin
+        hi = float(np.max(values)) + margin
+        return lo <= error <= hi
+
     @property
     def usable_range_um(self) -> tuple[float, float] | None:
         return zhuang_usable_range(self.params)
@@ -719,6 +739,14 @@ def auto_calibrate_zhuang(
                 f"{len(failed_moves)} failed. First: z={first_z:+.3f} um: {first_exc}"
             ) from first_exc
         raise RuntimeError("Calibration sweep could not collect enough valid points.")
+
+    fail_ratio = len(failed_moves) / total_steps if total_steps > 0 else 0.0
+    if fail_ratio > 0.2:
+        warnings.warn(
+            f"Zhuang calibration sweep completed with {len(failed_moves)}/{total_steps} failed stage moves; fit quality may be degraded.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     return out
 

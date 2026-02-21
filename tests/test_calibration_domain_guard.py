@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+
 from dataclasses import dataclass
 
-from auto_focus.autofocus import AstigmaticAutofocusController, AutofocusConfig, AutofocusState
+from auto_focus.autofocus import AstigmaticAutofocusController, AutofocusConfig, AutofocusState, AutofocusWorker
 from auto_focus.calibration import FocusCalibration
 from auto_focus.focus_metric import Roi
+from auto_focus.hardware import HamamatsuOrcaCamera
 from auto_focus.interfaces import CameraFrame
+from auto_focus.calibration import ZhuangFocusCalibration
+from auto_focus.zhuang import ZhuangParams, ZhuangEllipticityParams, ZhuangLookupTable
 
 
 class DummyCamera:
@@ -180,3 +184,80 @@ def test_roi_change_resets_setpoint_memory(monkeypatch):
     # Fresh ROI lock should not apply an immediate move.
     assert sample.control_applied is False
     assert sample.state == AutofocusState.LOCKED
+
+
+def test_lookup_domain_guard_handles_unsorted_error_values(monkeypatch):
+    monkeypatch.setattr("auto_focus.autofocus.astigmatic_error_signal", lambda _img, _roi: 0.6)
+    monkeypatch.setattr("auto_focus.autofocus.roi_total_intensity", lambda _img, _roi: 10.0)
+
+    cal = DummyZhuangCalibration(lookup=DummyLookup(error_values=[0.3, -0.3]))
+    stage = DummyStage()
+    controller = AstigmaticAutofocusController(DummyCamera(), stage, _config(), cal)
+
+    sample = controller.run_step()
+
+    assert sample.control_applied is False
+    assert sample.state == AutofocusState.DEGRADED
+
+
+def test_worker_uses_elapsed_dt(monkeypatch):
+    class StubController:
+        loop_hz = 10.0
+
+        def __init__(self):
+            self.dt_values: list[float] = []
+
+        def run_step(self, dt_s=None):
+            self.dt_values.append(float(dt_s))
+            if len(self.dt_values) >= 2:
+                raise RuntimeError("stop")
+            return None
+
+    clock = {"t": 100.0}
+
+    def fake_monotonic():
+        val = clock["t"]
+        clock["t"] += 0.15
+        return val
+
+    monkeypatch.setattr("auto_focus.autofocus.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("auto_focus.autofocus.time.sleep", lambda _s: None)
+
+    controller = StubController()
+    worker = AutofocusWorker(controller)
+    worker._run_loop()
+
+    assert len(controller.dt_values) == 2
+    assert controller.dt_values[0] == 0.1
+    assert controller.dt_values[1] == 0.45
+
+
+def test_hamamatsu_orca_requires_frame_source():
+    try:
+        HamamatsuOrcaCamera(frame_source=None)
+    except ValueError as exc:
+        assert "frame_source" in str(exc)
+    else:
+        raise AssertionError("expected ValueError when frame_source is None")
+
+
+def test_zhuang_from_axis_params_uses_sigma_ratio_for_e0():
+    px = ZhuangParams(sigma0=4.0, A=0.0, B=0.0, c=0.0, d=1.0)
+    py = ZhuangParams(sigma0=1.0, A=0.0, B=0.0, c=0.0, d=1.0)
+
+    q = ZhuangEllipticityParams.from_axis_params(px, py)
+
+    assert q.e0 == 4.0
+
+
+def test_zhuang_calibration_has_range_checker():
+    lookup = ZhuangLookupTable(error_values=[-0.2, 0.2], z_values_um=[-1.0, 1.0], z_range=(-1.0, 1.0))
+    cal = ZhuangFocusCalibration(
+        params=ZhuangEllipticityParams(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0),
+        params_x=ZhuangParams(1.0, 0.0, 0.0, 0.0, 1.0),
+        params_y=ZhuangParams(1.0, 0.0, 0.0, 0.0, 1.0),
+        lookup=lookup,
+    )
+
+    assert cal.is_error_in_range(0.0)
+    assert not cal.is_error_in_range(0.5)
