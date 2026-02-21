@@ -61,6 +61,20 @@ def _image_shape(image: Image2D) -> tuple[int, int]:
 
 
 def extract_roi(image: Image2D, roi: Roi) -> Image2D:
+    try:
+        import numpy as np
+
+        if isinstance(image, np.ndarray):
+            if image.ndim != 2:
+                raise ValueError("Image must be 2D")
+            safe_roi = roi.clamp((image.shape[0], image.shape[1]))
+            return image[
+                safe_roi.y : safe_roi.y + safe_roi.height,
+                safe_roi.x : safe_roi.x + safe_roi.width,
+            ]
+    except Exception:
+        pass
+
     safe_image = _coerce_image_2d(image)
     h, w = _image_shape(safe_image)
     safe_roi = roi.clamp((h, w))

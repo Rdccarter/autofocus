@@ -77,7 +77,7 @@ class ZhuangEllipticityParams:
     @classmethod
     def from_axis_params(cls, px: ZhuangParams, py: ZhuangParams) -> "ZhuangEllipticityParams":
         """Construct from independently fitted x and y axis parameters."""
-        e0 = math.sqrt(px.sigma0 / py.sigma0) if py.sigma0 > 0 else 1.0
+        e0 = (px.sigma0 / py.sigma0) if py.sigma0 > 0 else 1.0
         z0 = (px.c + py.c) / 2.0
         c = (px.c - py.c) / 2.0
         return cls(e0=e0, z0=z0, c=c,

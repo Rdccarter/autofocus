@@ -29,6 +29,11 @@ class HamamatsuOrcaCamera(CameraInterface):
         frame_source: Callable[[], tuple[Image2D, float]] | None = None,
         control_source_lifecycle: bool = False,
     ) -> None:
+        if frame_source is None:
+            raise ValueError(
+                "frame_source is required for HamamatsuOrcaCamera. "
+                "Provide a callable returning (image_2d, timestamp_s)."
+            )
         self._running = False
         self._frame_source = frame_source
         self._control_source_lifecycle = control_source_lifecycle
@@ -52,14 +57,6 @@ class HamamatsuOrcaCamera(CameraInterface):
         return self
 
     def __exit__(self, _exc_type, _exc, _tb) -> None:
-        self.stop()
-
-
-    def __enter__(self) -> "SimulatedCamera":
-        self.start()
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:  # pragma: no cover - trivial
         self.stop()
 
     def get_frame(self) -> CameraFrame:
